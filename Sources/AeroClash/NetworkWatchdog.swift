@@ -259,6 +259,7 @@ struct NetworkNotice: Identifiable, Equatable {
         case recovery  // 绿色：已恢复
         case info      // 蓝色：提示性消息
         case update    // 蓝色：发现新版本（保持显示）
+        case brief     // 绿色：一句话操作提示（如“网络设置已恢复”），约 2.5 秒后收起
     }
 
     let id = UUID()
@@ -275,6 +276,7 @@ struct NetworkNotice: Identifiable, Equatable {
         switch style {
         case .recovery: return 4
         case .info: return 6
+        case .brief: return 2.5
         case .failure, .warning, .update: return nil
         }
     }
@@ -294,6 +296,10 @@ struct NetworkNotice: Identifiable, Equatable {
 
     static func recovery(_ issue: NetworkIssue, title: String, detail: String) -> NetworkNotice {
         NetworkNotice(issue: issue, style: .recovery, title: title, detail: detail, symbol: "checkmark.circle.fill", actions: [])
+    }
+
+    static func brief(_ message: String) -> NetworkNotice {
+        NetworkNotice(issue: nil, style: .brief, title: message, detail: "", symbol: "checkmark.circle.fill", actions: [])
     }
 
     static func info(title: String, detail: String, symbol: String = "arrow.triangle.2.circlepath.circle.fill") -> NetworkNotice {

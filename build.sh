@@ -66,6 +66,8 @@ for arch in arm64 x86_64; do
     -framework Security \
     -framework Network \
     -framework Carbon \
+    -framework CoreWLAN \
+    -framework CoreLocation \
     -parse-as-library \
     -sdk "${SDK_PATH}" \
     -module-cache-path "${MODULE_CACHE_DIR}" \

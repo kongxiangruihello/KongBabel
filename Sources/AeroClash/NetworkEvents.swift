@@ -11,6 +11,7 @@ struct NetworkEvent: Identifiable, Codable, Equatable {
         case autoSwitch
         case highLatency
         case subscription
+        case wifiRule
 
         /// 是否属于“网络故障”（用于统计）
         var isFailure: Bool {
@@ -30,6 +31,7 @@ struct NetworkEvent: Identifiable, Codable, Equatable {
             case .autoSwitch: return "arrow.triangle.2.circlepath.circle.fill"
             case .highLatency: return "tortoise.fill"
             case .subscription: return "calendar.badge.clock"
+            case .wifiRule: return "wifi"
             }
         }
 

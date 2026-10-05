@@ -17,9 +17,9 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.9.7</string>
+    <string>1.10.1</string>
     <key>CFBundleVersion</key>
-    <string>197</string>
+    <string>201</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>NSHighResolutionCapable</key>
@@ -37,5 +37,9 @@
     <string>public.app-category.utilities</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon.png</string>
+    <key>NSLocationUsageDescription</key>
+    <string>KongBabel 需要读取当前 Wi‑Fi 名称，用于按 Wi‑Fi 自动开关代理。macOS 要求为此授予定位权限，KongBabel 不会获取或保存你的位置。</string>
+    <key>NSLocationWhenInUseUsageDescription</key>
+    <string>KongBabel 需要读取当前 Wi‑Fi 名称，用于按 Wi‑Fi 自动开关代理。macOS 要求为此授予定位权限，KongBabel 不会获取或保存你的位置。</string>
 </dict>
 </plist>

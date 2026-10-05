@@ -70,6 +70,34 @@ struct SettingsView: View {
                             PillButton(title: model.updateCheckInProgress ? "检查中" : "检查更新", icon: "arrow.clockwise") { model.checkForUpdates(manual: true) }
                         }
                     }
+                    SettingsGroup(title: "节点与流量") {
+                        SettingToggle(icon: "gauge.with.dots.needle.33percent", title: "低倍率优先", subtitle: "自动切换时，在延迟相近的节点中优先选择流量倍率低的", isOn: Binding(get: { model.preferLowMultiplier }, set: model.setPreferLowMultiplier))
+                        SettingsRow(icon: "line.3.horizontal.decrease.circle", title: "自动切换倍率上限", subtitle: "只在倍率不超过此值的节点之间自动切换（节点名中写有倍率时有效）") {
+                            Picker("", selection: Binding(get: { model.maxAutoSwitchMultiplier }, set: model.setMaxAutoSwitchMultiplier)) {
+                                Text("不限").tag(0.0)
+                                Text("×0.2").tag(0.2)
+                                Text("×0.5").tag(0.5)
+                                Text("×1").tag(1.0)
+                            }.labelsHidden().frame(width: 100)
+                        }
+                        SettingsRow(icon: "timer", title: "后台定时测速", subtitle: model.backgroundTesting ? "正在测速…" : "定时测一遍所有节点，让红绿点和自动切换更准确") {
+                            HStack(spacing: 8) {
+                                Picker("", selection: Binding(get: { model.backgroundTestInterval }, set: model.setBackgroundTestInterval)) {
+                                    Text("关闭").tag(0)
+                                    Text("每 15 分钟").tag(15)
+                                    Text("每 30 分钟").tag(30)
+                                    Text("每 60 分钟").tag(60)
+                                }.labelsHidden().frame(width: 120)
+                                PillButton(title: model.backgroundTesting ? "测速中" : "立即测速", icon: "bolt.horizontal") { model.runBackgroundTest(manual: true) }
+                            }
+                        }
+                    }
+                    SettingsGroup(title: "按 Wi‑Fi 自动开关代理") {
+                        SettingToggle(icon: "wifi", title: "按 Wi‑Fi 自动开关代理", subtitle: "连上指定的 Wi‑Fi 时自动开启或关闭系统代理；只在切换 Wi‑Fi 时生效，不影响手动操作", isOn: Binding(get: { model.wifiAutoEnabled }, set: model.setWiFiAutoEnabled))
+                        if model.wifiAutoEnabled {
+                            WiFiRulesEditor()
+                        }
+                    }
                     SettingsGroup(title: "流量接管") {
                         SettingsRow(icon: "checkmark.shield", title: "系统实际状态", subtitle: model.detectedCaptureMode?.rawValue ?? (model.isConnected && model.runtimeSettings.captureMode == .tun ? "TUN（由内核接管）" : "未启用")) {
                             StatusBadge()
@@ -371,3 +399,53 @@ struct PortBadge: View {
 }
 
 // MARK: - Command palette & menu bar
+
+/// 按 Wi‑Fi 自动开关代理的规则列表
+struct WiFiRulesEditor: View {
+    @EnvironmentObject var model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if let ssid = model.currentSSID {
+                SettingsRow(icon: "wifi", title: "当前 Wi‑Fi：\(ssid)", subtitle: ruleText(model.wifiRules[ssid])) {
+                    HStack(spacing: 8) {
+                        PillButton(title: "自动开启", icon: "power", active: model.wifiRules[ssid] == "enable") { model.setWiFiRule(ssid, action: "enable") }
+                        PillButton(title: "自动关闭", icon: "poweroff", active: model.wifiRules[ssid] == "disable") { model.setWiFiRule(ssid, action: "disable") }
+                        if model.wifiRules[ssid] != nil {
+                            PillButton(title: "不处理", icon: "minus.circle") { model.setWiFiRule(ssid, action: nil) }
+                        }
+                    }
+                }
+            } else if model.wifiNeedsPermission {
+                SettingsRow(icon: "location", title: "无法读取 Wi‑Fi 名称", subtitle: "macOS 要求授予“定位服务”权限才能读取 Wi‑Fi 名称；KongBabel 不会获取或保存你的位置") {
+                    PillButton(title: "授予权限", icon: "location") { model.requestWiFiPermission() }
+                }
+            } else {
+                SettingsRow(icon: "wifi.slash", title: "当前未连接 Wi‑Fi", subtitle: "连上 Wi‑Fi 后可以在这里为它设置规则") { EmptyView() }
+            }
+            ForEach(model.wifiRules.keys.sorted().filter { $0 != model.currentSSID }, id: \.self) { ssid in
+                SettingsRow(icon: "wifi", title: ssid, subtitle: ruleText(model.wifiRules[ssid])) {
+                    HStack(spacing: 8) {
+                        Picker("", selection: Binding(get: { model.wifiRules[ssid] ?? "enable" }, set: { model.setWiFiRule(ssid, action: $0) })) {
+                            Text("自动开启").tag("enable")
+                            Text("自动关闭").tag("disable")
+                        }.labelsHidden().frame(width: 100)
+                        Button { model.setWiFiRule(ssid, action: nil) } label: {
+                            Image(systemName: "trash").foregroundStyle(Theme.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help("删除这条 Wi‑Fi 规则")
+                    }
+                }
+            }
+        }
+    }
+
+    private func ruleText(_ action: String?) -> String {
+        switch action {
+        case "enable": return "连上时自动开启系统代理"
+        case "disable": return "连上时自动关闭系统代理"
+        default: return "未设置，连上时不做处理"
+        }
+    }
+}

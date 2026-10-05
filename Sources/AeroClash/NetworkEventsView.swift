@@ -65,7 +65,7 @@ struct NetworkEventRow: View {
         case .offline, .internetUnreachable, .coreStopped: return Theme.danger
         case .proxyUnreachable, .highLatency, .subscription: return Theme.warning
         case .recovered: return Theme.accent
-        case .autoSwitch: return Theme.accent2
+        case .autoSwitch, .wifiRule: return Theme.accent2
         }
     }
 

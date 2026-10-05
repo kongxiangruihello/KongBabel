@@ -116,14 +116,17 @@ extension AppModel {
             let delays = (try JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
             recordGroupDelays(delays, members: group.members)
             let excluded: Set<String> = ["DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE"]
-            var fastest: (name: String, delay: Int)?
-            var fastestFavorite: (name: String, delay: Int)?
+            var candidates: [SwitchCandidate] = []
             for (name, value) in delays {
                 guard name != previous, !excluded.contains(name.uppercased()), !excludedNodes.contains(name), !Self.isInfoNodeName(name),
                       let delay = (value as? NSNumber)?.intValue, delay > 0 else { continue }
-                if fastest == nil || delay < fastest!.delay { fastest = (name, delay) }
-                if favoriteNodes.contains(name), fastestFavorite == nil || delay < fastestFavorite!.delay { fastestFavorite = (name, delay) }
+                let rate = multiplier(for: name) ?? 1
+                if maxAutoSwitchMultiplier > 0, rate > maxAutoSwitchMultiplier + 0.0001 { continue }
+                candidates.append((name: name, delay: delay, multiplier: rate, favorite: favoriteNodes.contains(name)))
             }
+            // 常用节点优先；开启“低倍率优先”时，在延迟相近的节点中选倍率最低的
+            let fastest = pickSwitchCandidate(candidates)
+            let fastestFavorite = pickSwitchCandidate(candidates.filter { $0.favorite })
             let currentDelay = (delays[previous] as? NSNumber)?.intValue ?? 0
             // 常用节点优先；高延迟切换要求新节点明显更快，避免在差不多的节点之间来回跳
             let chosen: (name: String, delay: Int)?

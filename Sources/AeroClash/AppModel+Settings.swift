@@ -138,7 +138,7 @@ extension AppModel {
     func makeBackupPreferences() -> BackupPreferences {
         var bindings: [String: HotKeyBinding] = [:]
         for (id, binding) in hotKeyBindings { bindings[String(id)] = binding }
-        return BackupPreferences(
+        var preferences = BackupPreferences(
             favoriteNodes: favoriteNodes.sorted(),
             excludedNodes: excludedNodes.sorted(),
             hotKeyBindings: bindings,
@@ -152,6 +152,13 @@ extension AppModel {
             networkEvents: networkEvents,
             nodeStats: nodeStats
         )
+        preferences.preferLowMultiplier = preferLowMultiplier
+        preferences.maxAutoSwitchMultiplier = maxAutoSwitchMultiplier
+        preferences.nodeSortOrder = nodeSortOrder
+        preferences.backgroundTestInterval = backgroundTestInterval
+        preferences.wifiAutoEnabled = wifiAutoEnabled
+        preferences.wifiRules = wifiRules
+        return preferences
     }
 
     /// 应用备份中的个人偏好；备份里没有的项保持本机现状，网络事件与节点记录和本机合并
@@ -204,6 +211,31 @@ extension AppModel {
         if let stats = preferences.nodeStats {
             nodeStats = BackupPreferences.mergeNodeStats(nodeStats, stats)
             saveNodeStats()
+        }
+        if let value = preferences.preferLowMultiplier {
+            preferLowMultiplier = value
+            defaults.set(value, forKey: "preferLowMultiplier")
+        }
+        if let value = preferences.maxAutoSwitchMultiplier {
+            maxAutoSwitchMultiplier = value
+            defaults.set(value, forKey: "maxAutoSwitchMultiplier")
+        }
+        if let value = preferences.nodeSortOrder {
+            nodeSortOrder = value
+            defaults.set(value, forKey: "nodeSortOrder")
+        }
+        if let value = preferences.backgroundTestInterval {
+            backgroundTestInterval = value
+            defaults.set(value, forKey: "backgroundTestInterval")
+        }
+        if let value = preferences.wifiAutoEnabled {
+            wifiAutoEnabled = value
+            defaults.set(value, forKey: "wifiAutoEnabled")
+            lastHandledSSID = currentSSID
+        }
+        if let value = preferences.wifiRules {
+            wifiRules = value
+            defaults.set(value, forKey: "wifiRules")
         }
         configureGlobalHotKeys()
     }

@@ -7,7 +7,7 @@ import CoreImage.CIFilterBuiltins
 
 struct ProxiesView: View {
     @EnvironmentObject var model: AppModel
-    var filtered: [ProxyNode] { model.nodes.filter { model.searchText.isEmpty || $0.name.localizedCaseInsensitiveContains(model.searchText) || $0.city.localizedCaseInsensitiveContains(model.searchText) } }
+    var filtered: [ProxyNode] { model.sortedNodes(model.nodes.filter { model.searchText.isEmpty || $0.name.localizedCaseInsensitiveContains(model.searchText) || $0.city.localizedCaseInsensitiveContains(model.searchText) }) }
     var body: some View {
         VStack(spacing: 0) {
             PageHeader(title: "代理", subtitle: "选择流量出口与策略组") {
@@ -37,7 +37,13 @@ struct ProxiesView: View {
                 VStack(spacing: 0) {
                     HStack {
                         VStack(alignment: .leading, spacing: 3) { Text(model.selectedProxyGroup).font(.system(size: 18, weight: .bold)); Text("当前：\(model.selectedNode.name) · 右键节点可设为常用或跳过").font(.system(size: 11)).foregroundStyle(Theme.secondary).lineLimit(1) }
-                        Spacer(); SearchField(text: $model.searchText, placeholder: "搜索节点").frame(width: 210)
+                        Spacer()
+                        Picker("排序", selection: Binding(get: { model.nodeSortOrder }, set: model.setNodeSortOrder)) {
+                            Text("默认顺序").tag("default")
+                            Text("按倍率").tag("multiplier")
+                            Text("按延迟").tag("latency")
+                        }.labelsHidden().frame(width: 104)
+                        SearchField(text: $model.searchText, placeholder: "搜索节点").frame(width: 210)
                     }.padding(.horizontal, 22).padding(.bottom, 14)
                     ScrollView {
                         LazyVGrid(columns: [GridItem(.adaptive(minimum: 230), spacing: 12)], spacing: 12) {
@@ -62,6 +68,15 @@ struct ProxyNodeCard: View {
             VStack(alignment: .leading, spacing: 14) {
                 HStack {
                     Text(node.countryCode).font(.system(size: 26)); Spacer()
+                    if let rate = model.multiplierLabel(for: node.name) {
+                        Text(rate)
+                            .font(.system(size: 10, weight: .bold, design: .rounded))
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(Theme.accent2.opacity(0.12))
+                            .foregroundStyle(Theme.accent2)
+                            .clipShape(Capsule())
+                            .help("流量倍率 \(rate)：使用 1 GB 流量扣除 \(rate.dropFirst()) GB 订阅流量")
+                    }
                     if model.isFavorite(node.name) { Image(systemName: "star.fill").font(.system(size: 10)).foregroundStyle(Theme.warning).help("常用节点：自动切换时优先选择") }
                     if model.isExcluded(node.name) { Image(systemName: "nosign").font(.system(size: 10, weight: .semibold)).foregroundStyle(Theme.secondary).help("自动切换不会切到这里") }
                     if selected { Image(systemName: "checkmark.circle.fill").foregroundStyle(Theme.accent) }

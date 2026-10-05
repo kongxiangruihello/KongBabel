@@ -106,6 +106,26 @@ struct NetworkLogicTests {
         try expect(mergedStats["A"]?.samples.count == 3, "节点记录合并错误")
         try expect(mergedStats["B"]?.averageDelay == 500, "新增节点记录合并错误")
 
+        // 流量倍率识别
+        try expect(TrafficMultiplier.parse("日本-PRO-FW-JP1-流量倍率:0.2") == 0.2, "倍率识别：流量倍率:0.2")
+        try expect(TrafficMultiplier.parse("中国香港-PRO-IPLC-HK2-1-流量倍率:1") == 1, "倍率识别：流量倍率:1")
+        try expect(TrafficMultiplier.parse("香港 01 [0.5x]") == 0.5, "倍率识别：0.5x")
+        try expect(TrafficMultiplier.parse("美国 ×2") == 2, "倍率识别：×2")
+        try expect(TrafficMultiplier.parse("新加坡 3倍") == 3, "倍率识别：3倍")
+        try expect(TrafficMultiplier.parse("德国-PRO-FW-DE1") == nil, "没有倍率的节点不应识别出倍率")
+        try expect(TrafficMultiplier.parse("Proxy") == nil, "Proxy 不应识别出倍率")
+        try expect(TrafficMultiplier.label(0.2) == "×0.2" && TrafficMultiplier.label(1) == "×1", "倍率标签错误")
+
+        // 订阅流量记录与汇总
+        let chargedStore = ChargedTrafficStore(root: workDirectory)
+        let day = Date(timeIntervalSince1970: 1_800_000_000)
+        var chargedDays = chargedStore.record(actual: 1_000, charged: 200, on: day, into: [])
+        chargedDays = chargedStore.record(actual: 500, charged: 500, on: day, into: chargedDays)
+        try expect(chargedDays.count == 1 && chargedDays[0].actualBytes == 1_500 && chargedDays[0].chargedBytes == 700, "订阅流量累计错误")
+        try expect(chargedStore.load() == chargedDays, "订阅流量记录保存后读取不一致")
+        let chargedSummary = ChargedTrafficStore.summary(of: chargedDays, now: day)
+        try expect(chargedSummary.today.chargedBytes == 700 && chargedSummary.month == 700, "订阅流量汇总错误")
+
         print("NetworkLogicTests passed")
     }
 }

@@ -22,6 +22,7 @@ struct OverviewView: View {
                         QuickStat(icon: "bolt.fill", label: "活动连接", value: "\(model.activeConnections.count)", tint: Theme.warning)
                         QuickStat(icon: "clock.fill", label: "运行时间", value: model.uptimeText, tint: Color.purple.opacity(0.9))
                     }
+                    SubscriptionTrafficCard()
                     HStack(alignment: .top, spacing: 16) {
                         QuickActions().frame(maxWidth: .infinity)
                         RecentConnections().frame(maxWidth: .infinity)
@@ -160,3 +161,22 @@ struct RecentConnections: View {
 }
 
 // MARK: - Proxies
+
+/// 订阅流量估算：按每条连接所用节点的倍率折算，直连不计
+struct SubscriptionTrafficCard: View {
+    @EnvironmentObject var model: AppModel
+
+    var body: some View {
+        let summary = model.chargedTrafficSummary
+        HStack(spacing: 12) {
+            MetricCard(label: "今日扣除订阅流量", value: AppModel.byteText(summary.todayCharged),
+                       detail: "实际经代理 \(AppModel.byteText(summary.todayActual))，已按节点倍率折算",
+                       icon: "gauge.with.dots.needle.50percent", tint: Theme.accent2)
+            MetricCard(label: "本月扣除订阅流量", value: AppModel.byteText(summary.month),
+                       detail: "估算值，直连流量不计入", icon: "calendar", tint: Theme.warning)
+            MetricCard(label: "剩余流量预计可用", value: summary.daysLeft.map { "约 \($0) 天" } ?? "—",
+                       detail: summary.daysLeft == nil ? "需要订阅提供流量信息和几天的使用记录" : "按最近 7 天平均消耗估算",
+                       icon: "hourglass", tint: Theme.accent)
+        }
+    }
+}

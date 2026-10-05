@@ -89,6 +89,20 @@ final class AppModel: NSObject, ObservableObject {
     @Published var autoUpdateCheckEnabled = UserDefaults.standard.object(forKey: "autoUpdateCheckEnabled") as? Bool ?? true
     @Published var latestRelease: ReleaseInfo?
     @Published var updateCheckInProgress = false
+    /// 自动切换时在延迟相近的节点中优先选低倍率
+    @Published var preferLowMultiplier = UserDefaults.standard.object(forKey: "preferLowMultiplier") as? Bool ?? true
+    /// 自动切换只选倍率不超过此值的节点；0 表示不限
+    @Published var maxAutoSwitchMultiplier = UserDefaults.standard.object(forKey: "maxAutoSwitchMultiplier") as? Double ?? 0
+    @Published var nodeSortOrder = UserDefaults.standard.string(forKey: "nodeSortOrder") ?? "default"
+    /// 后台定时测速间隔（分钟）；0 表示关闭
+    @Published var backgroundTestInterval = UserDefaults.standard.object(forKey: "backgroundTestInterval") as? Int ?? 30
+    @Published var backgroundTesting = false
+    @Published var chargedTraffic: [ChargedTrafficDay]
+    @Published var wifiAutoEnabled = UserDefaults.standard.object(forKey: "wifiAutoEnabled") as? Bool ?? false
+    /// Wi‑Fi 名称 → "enable"（连上时开启代理）或 "disable"（连上时关闭代理）
+    @Published var wifiRules = UserDefaults.standard.dictionary(forKey: "wifiRules") as? [String: String] ?? [:]
+    @Published var currentSSID: String?
+    @Published var wifiNeedsPermission = false
 
     @Published var nodes: [ProxyNode] = []
     @Published var connections: [ConnectionItem] = []
@@ -109,6 +123,14 @@ final class AppModel: NSObject, ObservableObject {
     let nodeStatsStore: NodeStatsStore
     var hotKeyRecorder: Any?
     var lastUpdateCheckAttempt = Date.distantPast
+    let chargedTrafficStore: ChargedTrafficStore
+    let wifiMonitor = WiFiMonitor()
+    var lastBackgroundTest = Date.distantPast
+    var connectionByteCache: [String: Int64] = [:]
+    var pendingChargedActual: Int64 = 0
+    var pendingChargedBytes: Int64 = 0
+    var lastSSIDCheck = Date.distantPast
+    var lastHandledSSID: String?
     var networkIssueStartedAt: Date?
     var refreshCounter = 0
     var isRefreshing = false
@@ -156,6 +178,9 @@ final class AppModel: NSObject, ObservableObject {
         let nodeStatsStore = NodeStatsStore(root: repository.root)
         self.nodeStatsStore = nodeStatsStore
         self.nodeStats = nodeStatsStore.load()
+        let chargedTrafficStore = ChargedTrafficStore(root: repository.root)
+        self.chargedTrafficStore = chargedTrafficStore
+        self.chargedTraffic = chargedTrafficStore.load()
         if let data = UserDefaults.standard.data(forKey: "hotKeyBindings"),
            let saved = try? JSONDecoder().decode([String: HotKeyBinding].self, from: data) {
             var bindings: [UInt32: HotKeyBinding] = [:]
@@ -181,10 +206,13 @@ final class AppModel: NSObject, ObservableObject {
                 self?.checkLatencyIfNeeded()
                 self?.checkSubscriptionReminders()
                 self?.checkForUpdatesIfNeeded()
+                self?.checkBackgroundTestIfNeeded()
+                self?.checkWiFiIfNeeded()
             }
         }
         configureNetworkWatchdog()
         configureGlobalHotKeys()
+        configureWiFiMonitor()
         Task { await startCore() }
     }
 
@@ -409,6 +437,7 @@ final class AppModel: NSObject, ObservableObject {
         lastUploadBytes = uploadBytes
         lastDownloadBytes = downloadBytes
         lastTrafficDate = now
+        if refreshCounter % 6 == 0 { flushChargedTraffic() }
         if refreshCounter % 6 == 0, pendingHistoryUpload > 0 || pendingHistoryDownload > 0 {
             if let history = try? trafficHistoryStore.record(uploadBytes: pendingHistoryUpload, downloadBytes: pendingHistoryDownload) {
                 trafficHistory = history
@@ -424,6 +453,7 @@ final class AppModel: NSObject, ObservableObject {
         activity.append(min(1, downloadRate / 20))
 
         let rawConnections = root["connections"] as? [[String: Any]] ?? []
+        accountChargedTraffic(rawConnections)
         connections = rawConnections.prefix(250).map { raw in
             let metadata = raw["metadata"] as? [String: Any] ?? [:]
             let host = (metadata["host"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? (metadata["destinationIP"] as? String) ?? "未知目标"
@@ -530,6 +560,7 @@ final class AppModel: NSObject, ObservableObject {
     }
 
     @objc private func applicationWillTerminate() {
+        flushChargedTraffic()
         if pendingHistoryUpload > 0 || pendingHistoryDownload > 0 {
             _ = try? trafficHistoryStore.record(uploadBytes: pendingHistoryUpload, downloadBytes: pendingHistoryDownload)
             pendingHistoryUpload = 0
@@ -542,10 +573,13 @@ final class AppModel: NSObject, ObservableObject {
         core.stop()
     }
 
+    /// 操作提示统一显示在菜单栏图标下方，与网络状态提示同一风格；
+    /// 正在显示需要处理的故障、订阅或更新提醒时不覆盖它们
     func showToast(_ message: String) {
-        toast = message
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.2) { [weak self] in
-            if self?.toast == message { self?.toast = nil }
+        if let current = networkNotice, [NetworkNotice.Style.failure, .warning, .update].contains(current.style) {
+            appendLog(level: "INFO", message: message)
+            return
         }
+        networkNotice = .brief(message)
     }
 }

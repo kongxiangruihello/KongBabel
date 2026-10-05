@@ -115,6 +115,11 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
             if noticePopover.isShown { noticePopover.performClose(nil) }
             return
         }
+        // 快捷面板打开时，面板本身已经显示了操作结果，一句话提示不再弹出（也避免把面板关掉）
+        if notice.style == .brief && contextPopover.isShown {
+            model.dismissNetworkNotice()
+            return
+        }
         contextPopover.performClose(nil)
         let host = NSHostingController(
             rootView: NetworkNoticeView(notice: notice)
@@ -253,10 +258,12 @@ struct NetworkNoticeView: View {
                         .frame(width: 26)
                     VStack(alignment: .leading, spacing: 4) {
                         Text(notice.title).font(.system(size: 13, weight: .bold)).foregroundStyle(Theme.text)
-                        Text(notice.detail)
-                            .font(.system(size: 11))
-                            .foregroundStyle(Theme.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
+                        if !notice.detail.isEmpty {
+                            Text(notice.detail)
+                                .font(.system(size: 11))
+                                .foregroundStyle(Theme.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                     }
                     Spacer(minLength: 0)
                     Button { model.dismissNetworkNotice() } label: {
@@ -296,6 +303,7 @@ struct NetworkNoticeView: View {
         case .warning: return Theme.warning
         case .recovery: return Theme.accent
         case .info, .update: return Theme.accent2
+        case .brief: return Theme.accent
         }
     }
 }
@@ -386,7 +394,7 @@ struct TrayContextMenuView: View {
                                         model.selectNode(named: member, in: group.name)
                                         dismiss()
                                     } label: {
-                                        TrayMenuRow(title: member, checked: group.now == member, indented: true, status: nodeStatusColor(member))
+                                        TrayMenuRow(title: member, detail: model.multiplierLabel(for: member), checked: group.now == member, indented: true, status: nodeStatusColor(member))
                                     }
                                     .buttonStyle(TrayMenuButtonStyle())
                                     .help(nodeStatusText(member))
@@ -477,7 +485,7 @@ struct TrayContextMenuView: View {
                 .frame(height: 26)
                 .background(summary.isUrgent ? Theme.danger.opacity(0.08) : Theme.panel)
                 .clipShape(RoundedRectangle(cornerRadius: 7))
-                .help(summary.text)
+                .help(summary.text + "\n今日约扣订阅流量 " + AppModel.byteText(model.chargedTrafficSummary.todayCharged))
             }
             HStack(spacing: 11) {
                 Image(nsImage: NSApplication.shared.applicationIconImage)

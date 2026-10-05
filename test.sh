@@ -16,7 +16,7 @@ mkdir -p "${OUT}" "${MODULE_CACHE_DIR}"
 # 测试用到的非界面源码（不包含 SwiftUI 页面和 AppModel）
 LOGIC_SOURCES=(
   AdvancedSettings Runtime SubscriptionFormatter SubscriptionDownloader Models
-  AppInfo NetworkWatchdog NetworkEvents NodeStats UpdateChecker GlobalHotKeys BackupPreferences
+  AppInfo NetworkWatchdog NetworkEvents NodeStats UpdateChecker GlobalHotKeys BackupPreferences TrafficMultiplier
 )
 SOURCES=()
 for name in "${LOGIC_SOURCES[@]}"; do SOURCES+=("${SRC}/${name}.swift"); done

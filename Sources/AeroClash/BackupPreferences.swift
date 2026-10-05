@@ -16,6 +16,12 @@ struct BackupPreferences: Codable, Equatable {
     var showMenuBarRates: Bool?
     var networkEvents: [NetworkEvent]?
     var nodeStats: [String: NodeStats]?
+    var preferLowMultiplier: Bool?
+    var maxAutoSwitchMultiplier: Double?
+    var nodeSortOrder: String?
+    var backgroundTestInterval: Int?
+    var wifiAutoEnabled: Bool?
+    var wifiRules: [String: String]?
 
     /// 合并网络事件：按 id 去重、按时间倒序，最多保留 NetworkEventStore.limit 条
     static func mergeEvents(_ local: [NetworkEvent], _ remote: [NetworkEvent]) -> [NetworkEvent] {
