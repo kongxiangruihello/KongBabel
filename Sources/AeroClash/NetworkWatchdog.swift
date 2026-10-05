@@ -231,6 +231,8 @@ enum NetworkNoticeAction: Hashable {
     case diagnose
     case restartCore
     case showLogs
+    case updateSubscription(profileID: String)
+    case openProfiles
 
     var title: String {
         switch self {
@@ -239,37 +241,57 @@ enum NetworkNoticeAction: Hashable {
         case .diagnose: return "诊断网络"
         case .restartCore: return "重启内核"
         case .showLogs: return "查看日志"
+        case .updateSubscription: return "更新订阅"
+        case .openProfiles: return "查看配置"
         }
     }
 }
 
+/// 菜单栏图标下方弹出的提示（网络故障、恢复、自动切换、订阅提醒等）。
 struct NetworkNotice: Identifiable, Equatable {
+    enum Style: Equatable {
+        case failure   // 红色：需要处理的故障
+        case warning   // 橙色：需要注意
+        case recovery  // 绿色：已恢复
+        case info      // 蓝色：提示性消息
+    }
+
     let id = UUID()
-    let issue: NetworkIssue
-    /// true 表示“已恢复”提示，false 表示故障提示。
-    let isRecovery: Bool
+    /// 对应的网络故障；订阅提醒等与网络故障无关的提示为 nil。
+    let issue: NetworkIssue?
+    let style: Style
     let title: String
     let detail: String
-    /// true 表示提示性消息（如“已自动切换节点”），不需要用户操作。
-    var isInfo = false
+    let symbol: String
+    let actions: [NetworkNoticeAction]
 
-    var actions: [NetworkNoticeAction] {
-        guard !isRecovery, !isInfo else { return [] }
-        switch issue {
-        case .offline, .internetUnreachable: return [.openNetworkSettings]
-        case .proxyUnreachable: return [.testAndSwitch, .diagnose]
-        case .coreStopped: return [.restartCore, .showLogs]
+    /// 自动收起的秒数；nil 表示保持显示直到用户处理。
+    var autoDismissAfter: TimeInterval? {
+        switch style {
+        case .recovery: return 4
+        case .info: return 6
+        case .failure, .warning: return nil
         }
     }
 
-    var symbol: String {
-        if isRecovery { return "checkmark.circle.fill" }
-        if isInfo { return "arrow.triangle.2.circlepath.circle.fill" }
+    static func failure(_ issue: NetworkIssue, detail: String) -> NetworkNotice {
+        let actions: [NetworkNoticeAction]
+        let symbol: String
         switch issue {
-        case .offline: return "wifi.slash"
-        case .internetUnreachable: return "wifi.exclamationmark"
-        case .proxyUnreachable: return "exclamationmark.triangle.fill"
-        case .coreStopped: return "xmark.octagon.fill"
+        case .offline: actions = [.openNetworkSettings]; symbol = "wifi.slash"
+        case .internetUnreachable: actions = [.openNetworkSettings]; symbol = "wifi.exclamationmark"
+        case .proxyUnreachable: actions = [.testAndSwitch, .diagnose]; symbol = "exclamationmark.triangle.fill"
+        case .coreStopped: actions = [.restartCore, .showLogs]; symbol = "xmark.octagon.fill"
         }
+        return NetworkNotice(issue: issue, style: issue == .proxyUnreachable ? .warning : .failure,
+                             title: issue.title, detail: detail, symbol: symbol, actions: actions)
+    }
+
+    static func recovery(_ issue: NetworkIssue, title: String, detail: String) -> NetworkNotice {
+        NetworkNotice(issue: issue, style: .recovery, title: title, detail: detail, symbol: "checkmark.circle.fill", actions: [])
+    }
+
+    static func info(title: String, detail: String) -> NetworkNotice {
+        NetworkNotice(issue: nil, style: .info, title: title, detail: detail, symbol: "arrow.triangle.2.circlepath.circle.fill", actions: [])
     }
 }

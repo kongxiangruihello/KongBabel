@@ -73,6 +73,9 @@ final class AppModel: NSObject, ObservableObject {
     /// 当前未恢复的网络故障，用于菜单栏图标上的状态小圆点；nil 表示网络正常。
     @Published var networkIssueBadge: NetworkIssue?
     @Published var autoSwitchNodeEnabled = UserDefaults.standard.object(forKey: "autoSwitchNodeEnabled") as? Bool ?? true
+    /// 延迟上限（毫秒），连续两次超过即自动切换节点；0 表示关闭。
+    @Published var highLatencyThreshold = UserDefaults.standard.object(forKey: "highLatencyThreshold") as? Int ?? 1_000
+    @Published var subscriptionRemindersEnabled = UserDefaults.standard.object(forKey: "subscriptionRemindersEnabled") as? Bool ?? true
 
     @Published var nodes: [ProxyNode] = []
     @Published var connections: [ConnectionItem] = []
@@ -102,6 +105,10 @@ final class AppModel: NSObject, ObservableObject {
     private var networkAlertsSnoozedUntil = Date.distantPast
     private var autoSwitchInProgress = false
     private var lastAutoSwitchAttempt = Date.distantPast
+    private var lastLatencyCheck = Date.distantPast
+    private var latencyCheckInFlight = false
+    private var highLatencyStrikes = 0
+    private var lastSubscriptionReminderCheck = Date.distantPast
 
     override init() {
         let repository = ProfileRepository()
@@ -137,6 +144,8 @@ final class AppModel: NSObject, ObservableObject {
             Task { @MainActor in
                 await self?.refreshRuntime()
                 self?.networkWatchdog.tick()
+                self?.checkLatencyIfNeeded()
+                self?.checkSubscriptionReminders()
             }
         }
         configureNetworkWatchdog()
@@ -175,10 +184,21 @@ final class AppModel: NSObject, ObservableObject {
     }
 
     private func menuBarRate(_ megabytesPerSecond: Double) -> String {
+        let parts = rateParts(megabytesPerSecond)
+        return parts.value + parts.unit
+    }
+
+    /// 统一的速率格式：小于 1 MB/s 显示 KB/s（整数），否则显示 MB/s（两位小数）。
+    func rateParts(_ megabytesPerSecond: Double) -> (value: String, unit: String) {
         if megabytesPerSecond < 1 {
-            return "\(Int((megabytesPerSecond * 1_024).rounded()))KB/s"
+            return ("\(Int((megabytesPerSecond * 1_024).rounded()))", "KB/s")
         }
-        return String(format: "%.2fMB/s", megabytesPerSecond)
+        return (String(format: "%.2f", megabytesPerSecond), "MB/s")
+    }
+
+    func rateText(_ megabytesPerSecond: Double) -> String {
+        let parts = rateParts(megabytesPerSecond)
+        return "\(parts.value) \(parts.unit)"
     }
 
     func startCore() async {
@@ -1073,7 +1093,7 @@ final class AppModel: NSObject, ObservableObject {
             networkAlertsSnoozedUntil = .distantPast
             networkWatchdog.recheckSoon()
         } else {
-            networkNotice = nil
+            if networkNotice?.issue != nil { networkNotice = nil }
             networkIssueBadge = nil
         }
         showToast(enabled ? "已开启网络状态提醒" : "已关闭网络状态提醒")
@@ -1082,7 +1102,21 @@ final class AppModel: NSObject, ObservableObject {
     func setAutoSwitchNodeEnabled(_ enabled: Bool) {
         autoSwitchNodeEnabled = enabled
         UserDefaults.standard.set(enabled, forKey: "autoSwitchNodeEnabled")
-        showToast(enabled ? "节点失效时将自动切换" : "已关闭自动切换节点")
+        showToast(enabled ? "节点失效或延迟过高时将自动切换" : "已关闭自动切换节点")
+    }
+
+    func setHighLatencyThreshold(_ milliseconds: Int) {
+        highLatencyThreshold = milliseconds
+        highLatencyStrikes = 0
+        UserDefaults.standard.set(milliseconds, forKey: "highLatencyThreshold")
+        showToast(milliseconds > 0 ? "延迟超过 \(milliseconds) ms 时自动切换" : "已关闭高延迟自动切换")
+    }
+
+    func setSubscriptionRemindersEnabled(_ enabled: Bool) {
+        subscriptionRemindersEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: "subscriptionRemindersEnabled")
+        if enabled { lastSubscriptionReminderCheck = .distantPast }
+        showToast(enabled ? "已开启订阅到期与流量提醒" : "已关闭订阅到期与流量提醒")
     }
 
     private func configureNetworkWatchdog() {
@@ -1107,9 +1141,10 @@ final class AppModel: NSObject, ObservableObject {
         appendLog(level: "WARN", message: issue.logMessage)
         recordDiagnostic("network-issue=\(issue)")
         networkIssueBadge = issue
+        highLatencyStrikes = 0
         if issue == .proxyUnreachable, autoSwitchNodeEnabled, !autoSwitchInProgress,
            Date().timeIntervalSince(lastAutoSwitchAttempt) > 120 {
-            Task { await autoSwitchAfterFailure() }
+            Task { await autoSwitch(reason: .unreachable) }
             return
         }
         presentIssueNotice(issue)
@@ -1119,19 +1154,28 @@ final class AppModel: NSObject, ObservableObject {
         guard Date() >= networkAlertsSnoozedUntil else { return }
         var detail = networkNoticeDetail(for: issue)
         if let extraDetail { detail += "\n\(extraDetail)" }
-        networkNotice = NetworkNotice(issue: issue, isRecovery: false, title: issue.title, detail: detail)
+        networkNotice = .failure(issue, detail: detail)
     }
 
-    /// 代理不可用时：对当前策略组测速，切换到延迟最低的可用节点。
-    private func autoSwitchAfterFailure() async {
+    private enum AutoSwitchReason {
+        case unreachable
+        case highLatency(Int)
+    }
+
+    /// 对当前策略组测速，切换到延迟最低的可用节点。
+    private func autoSwitch(reason: AutoSwitchReason) async {
         autoSwitchInProgress = true
         lastAutoSwitchAttempt = Date()
         defer { autoSwitchInProgress = false }
-        let previous = selectedNodeID
+        let isUnreachable: Bool
+        if case .unreachable = reason { isUnreachable = true } else { isUnreachable = false }
         guard let group = autoSwitchTargetGroup() else {
-            presentIssueNotice(.proxyUnreachable, extraDetail: "当前策略组不支持手动切换，未能自动更换节点。")
+            if isUnreachable {
+                presentIssueNotice(.proxyUnreachable, extraDetail: "当前策略组不支持手动切换，未能自动更换节点。")
+            }
             return
         }
+        let previous = group.now
         appendLog(level: "INFO", message: "自动切换：正在为“\(group.name)”测速")
         do {
             let encoded = group.name.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? group.name
@@ -1141,35 +1185,50 @@ final class AppModel: NSObject, ObservableObject {
             let excluded: Set<String> = ["DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE"]
             var best: (name: String, delay: Int)?
             for (name, value) in delays {
-                guard name != group.now, !excluded.contains(name.uppercased()),
+                guard name != previous, !excluded.contains(name.uppercased()),
                       let delay = (value as? NSNumber)?.intValue, delay > 0 else { continue }
                 if best == nil || delay < best!.delay { best = (name, delay) }
             }
             guard let best else {
                 await refreshProxies()
-                presentIssueNotice(.proxyUnreachable, extraDetail: "已对“\(group.name)”全部节点测速，没有找到可用节点，可能需要更新订阅。")
+                if isUnreachable {
+                    presentIssueNotice(.proxyUnreachable, extraDetail: "已对“\(group.name)”全部节点测速，没有找到可用节点，可能需要更新订阅。")
+                } else {
+                    appendLog(level: "INFO", message: "自动切换：没有找到更快的节点，保持“\(previous)”")
+                }
                 return
+            }
+            if case .highLatency(let current) = reason {
+                // 只有明显更快时才切换，避免在差不多的节点之间来回跳
+                guard best.delay < highLatencyThreshold, Double(best.delay) < Double(current) * 0.7 else {
+                    await refreshProxies()
+                    appendLog(level: "INFO", message: "自动切换：最快节点“\(best.name)”\(best.delay) ms，并不明显更快，保持“\(previous)”")
+                    return
+                }
             }
             _ = try await api.request("/proxies/\(encoded)", method: "PUT", json: ["name": best.name])
             selectedProxyGroup = group.name
             await refreshProxies()
             appendLog(level: "INFO", message: "自动切换：\(group.name) 由 \(previous) 切换至 \(best.name)（\(best.delay) ms）")
             recordDiagnostic("auto-switch=\(group.name):\(best.name)")
-            networkWatchdog.retryAfterRemedy()
+            let detail: String
+            switch reason {
+            case .unreachable:
+                networkWatchdog.retryAfterRemedy()
+                detail = "原节点“\(previous)”无法访问外网，已切换到“\(best.name)”（\(best.delay) ms）。正在重新检测网络…"
+            case .highLatency(let current):
+                detail = "原节点“\(previous)”延迟 \(current) ms，已切换到更快的“\(best.name)”（\(best.delay) ms）。"
+            }
             if Date() >= networkAlertsSnoozedUntil {
-                networkNotice = NetworkNotice(
-                    issue: .proxyUnreachable,
-                    isRecovery: false,
-                    title: "已自动切换节点",
-                    detail: "原节点“\(previous)”无法访问外网，已切换到“\(best.name)”（\(best.delay) ms）。正在重新检测网络…",
-                    isInfo: true
-                )
+                networkNotice = .info(title: "已自动切换节点", detail: detail)
             } else {
                 showToast("已自动切换到 \(best.name)")
             }
         } catch {
             appendLog(level: "WARN", message: "自动切换失败：\(error.localizedDescription)")
-            presentIssueNotice(.proxyUnreachable, extraDetail: "自动切换失败：\(error.localizedDescription)")
+            if isUnreachable {
+                presentIssueNotice(.proxyUnreachable, extraDetail: "自动切换失败：\(error.localizedDescription)")
+            }
         }
     }
 
@@ -1181,6 +1240,98 @@ final class AppModel: NSObject, ObservableObject {
         return selectors.first { $0.name != "GLOBAL" }
     }
 
+    /// 定期测量当前节点延迟；连续两次超过上限时自动切换到更快的节点。
+    private func checkLatencyIfNeeded() {
+        guard highLatencyThreshold > 0, autoSwitchNodeEnabled, coreState == .running, isConnected,
+              mode != .direct, networkIssueBadge == nil, !latencyCheckInFlight, !autoSwitchInProgress else { return }
+        let interval: TimeInterval = highLatencyStrikes > 0 ? 20 : 60
+        guard Date().timeIntervalSince(lastLatencyCheck) >= interval,
+              let group = autoSwitchTargetGroup(), !group.now.isEmpty else { return }
+        lastLatencyCheck = Date()
+        latencyCheckInFlight = true
+        let node = group.now
+        Task {
+            defer { latencyCheckInFlight = false }
+            guard let delay = await measureDelay(of: node) else { return } // 连不通由网络监测处理
+            guard delay > highLatencyThreshold else {
+                highLatencyStrikes = 0
+                return
+            }
+            highLatencyStrikes += 1
+            appendLog(level: "WARN", message: "延迟检测：“\(node)”\(delay) ms，超过上限 \(highLatencyThreshold) ms（第 \(highLatencyStrikes) 次）")
+            guard highLatencyStrikes >= 2, !autoSwitchInProgress,
+                  Date().timeIntervalSince(lastAutoSwitchAttempt) > 300 else { return }
+            highLatencyStrikes = 0
+            await autoSwitch(reason: .highLatency(delay))
+        }
+    }
+
+    private func measureDelay(of proxyName: String) async -> Int? {
+        let encoded = proxyName.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? proxyName
+        let testURL = "https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204"
+        guard let data = try? await api.request("/proxies/\(encoded)/delay?url=\(testURL)&timeout=5000"),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let delay = (json["delay"] as? NSNumber)?.intValue, delay > 0 else { return nil }
+        return delay
+    }
+
+    // MARK: Subscription reminders
+
+    /// 订阅到期前 3 天、流量剩余 10% 时各提醒一次（同一情况只提醒一次）。
+    private func checkSubscriptionReminders() {
+        guard subscriptionRemindersEnabled, networkNotice == nil,
+              Date().timeIntervalSince(lastSubscriptionReminderCheck) > 600 else { return }
+        lastSubscriptionReminderCheck = Date()
+        var reminded = Set(UserDefaults.standard.stringArray(forKey: "subscriptionRemindersShown") ?? [])
+        for profile in profiles where profile.remoteURL != nil {
+            guard let usage = usage(for: profile) else { continue }
+            var candidates: [(key: String, notice: NetworkNotice)] = []
+            if let expiresAt = usage.expiresAt {
+                let formatter = DateFormatter()
+                formatter.dateFormat = "M 月 d 日"
+                let dateText = formatter.string(from: expiresAt)
+                let stamp = Int(expiresAt.timeIntervalSince1970)
+                let days = expiresAt.timeIntervalSinceNow / 86_400
+                if days <= 0 {
+                    candidates.append(("expired-\(profile.id)-\(stamp)", subscriptionNotice(
+                        profile, style: .failure, title: "订阅已过期", symbol: "calendar.badge.exclamationmark",
+                        detail: "“\(profile.name)”已于 \(dateText) 到期，节点可能无法使用，请续费后更新订阅。")))
+                } else if days <= 3 {
+                    let left = max(1, Int(days.rounded(.up)))
+                    candidates.append(("expiring-\(profile.id)-\(stamp)", subscriptionNotice(
+                        profile, style: .warning, title: "订阅即将到期", symbol: "calendar.badge.clock",
+                        detail: "“\(profile.name)”将于 \(dateText) 到期，还剩 \(left) 天。")))
+                }
+            }
+            if usage.totalBytes > 0 {
+                let remaining = max(0, usage.totalBytes - usage.usedBytes)
+                let ratio = Double(remaining) / Double(usage.totalBytes)
+                let remainingText = ByteCountFormatter.string(fromByteCount: remaining, countStyle: .decimal)
+                if remaining == 0 {
+                    candidates.append(("traffic-out-\(profile.id)-\(usage.totalBytes)", subscriptionNotice(
+                        profile, style: .failure, title: "订阅流量已用完", symbol: "gauge.with.dots.needle.0percent",
+                        detail: "“\(profile.name)”的流量已经用完，节点可能无法使用。")))
+                } else if ratio <= 0.1 {
+                    candidates.append(("traffic-low-\(profile.id)-\(usage.totalBytes)", subscriptionNotice(
+                        profile, style: .warning, title: "订阅流量即将用完", symbol: "gauge.with.dots.needle.33percent",
+                        detail: "“\(profile.name)”剩余 \(remainingText)（\(Int((ratio * 100).rounded()))%）。")))
+                }
+            }
+            if let next = candidates.first(where: { !reminded.contains($0.key) }) {
+                reminded.insert(next.key)
+                UserDefaults.standard.set(Array(reminded), forKey: "subscriptionRemindersShown")
+                appendLog(level: "WARN", message: "订阅提醒：\(next.notice.title) · \(profile.name)")
+                networkNotice = next.notice
+                return // 一次只弹一个，其余的下次检查再提醒
+            }
+        }
+    }
+
+    private func subscriptionNotice(_ profile: Profile, style: NetworkNotice.Style, title: String, symbol: String, detail: String) -> NetworkNotice {
+        NetworkNotice(issue: nil, style: style, title: title, detail: detail, symbol: symbol,
+                      actions: [.updateSubscription(profileID: profile.id), .openProfiles])
+    }
+
     private func handleNetworkRecovery(_ issue: NetworkIssue) {
         networkIssueBadge = nil
         appendLog(level: "INFO", message: "网络检测：已恢复（\(issue.title)）")
@@ -1190,7 +1341,7 @@ final class AppModel: NSObject, ObservableObject {
             showToast(title)
             return
         }
-        networkNotice = NetworkNotice(issue: issue, isRecovery: true, title: title, detail: currentNetworkSummary())
+        networkNotice = .recovery(issue, title: title, detail: currentNetworkSummary())
     }
 
     private func currentNetworkSummary() -> String {
@@ -1236,6 +1387,10 @@ final class AppModel: NSObject, ObservableObject {
             Task { await startCore() }
         case .showLogs:
             showMainWindow(section: .logs)
+        case .updateSubscription(let profileID):
+            if let profile = profiles.first(where: { $0.id == profileID }) { updateProfile(profile) }
+        case .openProfiles:
+            showMainWindow(section: .profiles)
         }
     }
 
@@ -1581,14 +1736,14 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
         if !noticePopover.isShown {
             noticePopover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         }
-        if notice.isRecovery || notice.isInfo {
+        if let delay = notice.autoDismissAfter {
             // 恢复/提示性消息几秒后自动收起；故障提示保持显示，直到用户处理或点击别处
             let work = DispatchWorkItem { [weak self] in
                 guard let self, self.model.networkNotice?.id == notice.id else { return }
                 self.model.dismissNetworkNotice()
             }
             noticeCloseWork = work
-            DispatchQueue.main.asyncAfter(deadline: .now() + (notice.isInfo ? 6 : 4), execute: work)
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
         }
     }
 
@@ -1738,10 +1893,12 @@ struct NetworkNoticeView: View {
                             }.buttonStyle(.plain)
                         }
                         Spacer(minLength: 0)
-                        Button("30 分钟内不提醒") { model.dismissNetworkNotice(snooze: true) }
-                            .buttonStyle(.plain)
-                            .font(.system(size: 10))
-                            .foregroundStyle(Theme.secondary)
+                        if notice.issue != nil {
+                            Button("30 分钟内不提醒") { model.dismissNetworkNotice(snooze: true) }
+                                .buttonStyle(.plain)
+                                .font(.system(size: 10))
+                                .foregroundStyle(Theme.secondary)
+                        }
                     }
                 }
             }
@@ -1751,8 +1908,12 @@ struct NetworkNoticeView: View {
     }
 
     private func tint(_ notice: NetworkNotice) -> Color {
-        if notice.isRecovery { return Theme.accent }
-        return notice.issue == .proxyUnreachable ? Theme.warning : Theme.danger
+        switch notice.style {
+        case .failure: return Theme.danger
+        case .warning: return Theme.warning
+        case .recovery: return Theme.accent
+        case .info: return Theme.accent2
+        }
     }
 }
 
@@ -2370,11 +2531,11 @@ struct TrafficCard: View {
         VStack(alignment: .leading, spacing: 14) {
             SectionTitle(title: "实时速率", detail: "最近 30 秒")
             HStack(alignment: .lastTextBaseline, spacing: 8) {
-                Text(String(format: "%.2f", model.downloadRate)).font(.system(size: 34, weight: .bold, design: .rounded))
-                Text("MB/s").font(.system(size: 12, weight: .semibold)).foregroundStyle(Theme.secondary)
+                Text(model.rateParts(model.downloadRate).value).font(.system(size: 34, weight: .bold, design: .rounded))
+                Text(model.rateParts(model.downloadRate).unit).font(.system(size: 12, weight: .semibold)).foregroundStyle(Theme.secondary)
                 Spacer()
                 VStack(alignment: .trailing, spacing: 3) {
-                    Label(String(format: "%.2f MB/s", model.uploadRate), systemImage: "arrow.up").font(.system(size: 11, weight: .medium)).foregroundStyle(Theme.accent2)
+                    Label(model.rateText(model.uploadRate), systemImage: "arrow.up").font(.system(size: 11, weight: .medium)).foregroundStyle(Theme.accent2)
                     Text("上传").font(.system(size: 10)).foregroundStyle(Theme.secondary)
                 }
             }
@@ -2531,7 +2692,7 @@ struct ProxyNodeCard: View {
                     if node.favorite { Image(systemName: "star.fill").font(.system(size: 10)).foregroundStyle(Theme.warning) }
                     if selected { Image(systemName: "checkmark.circle.fill").foregroundStyle(Theme.accent) }
                 }
-                VStack(alignment: .leading, spacing: 3) { Text(node.name).font(.system(size: 14, weight: .bold)); Text("\(node.city) · \(node.type)").font(.system(size: 10)).foregroundStyle(Theme.secondary) }
+                VStack(alignment: .leading, spacing: 3) { Text(node.name).font(.system(size: 14, weight: .bold)).lineLimit(1).truncationMode(.middle); Text("\(node.city) · \(node.type)").font(.system(size: 10)).foregroundStyle(Theme.secondary) }.help(node.name)
                 HStack {
                     Circle().fill(latencyColor).frame(width: 6, height: 6); Text("\(node.latency) ms").font(.system(size: 10, weight: .semibold)).foregroundStyle(latencyColor)
                     Spacer(); Text("负载 \(Int(node.load * 100))%").font(.system(size: 9)).foregroundStyle(Theme.secondary)
@@ -2558,8 +2719,8 @@ struct ConnectionsView: View {
             }
             HStack(spacing: 12) {
                 MetricCard(label: "活动连接", value: "\(model.activeConnections.count)", detail: "Mihomo 实时会话", icon: "bolt.horizontal.fill", tint: Theme.accent)
-                MetricCard(label: "上传速率", value: String(format: "%.2f MB/s", model.uploadRate), detail: String(format: "今日 %.2f GB", model.totalUpload), icon: "arrow.up", tint: Theme.accent2)
-                MetricCard(label: "下载速率", value: String(format: "%.2f MB/s", model.downloadRate), detail: String(format: "今日 %.2f GB", model.totalDownload), icon: "arrow.down", tint: Theme.warning)
+                MetricCard(label: "上传速率", value: model.rateText(model.uploadRate), detail: String(format: "今日 %.2f GB", model.totalUpload), icon: "arrow.up", tint: Theme.accent2)
+                MetricCard(label: "下载速率", value: model.rateText(model.downloadRate), detail: String(format: "今日 %.2f GB", model.totalDownload), icon: "arrow.down", tint: Theme.warning)
             }.padding(.horizontal, 30).padding(.bottom, 16)
             VStack(spacing: 0) {
                 HStack { SearchField(text: $query, placeholder: "搜索域名或应用").frame(width: 260); Toggle("仅活动", isOn: $onlyActive).toggleStyle(.switch).controlSize(.small).font(.system(size: 11)); Spacer(); Text("按下载流量排序").font(.system(size: 10)).foregroundStyle(Theme.secondary) }.padding(14)
@@ -2943,7 +3104,20 @@ struct SettingsView: View {
                         SettingToggle(icon: "power", title: "登录时启动", subtitle: "使用 macOS 原生登录项目运行 KongBabel", isOn: Binding(get: { model.launchAtLogin }, set: model.setLaunchAtLogin))
                         SettingToggle(icon: "arrow.clockwise", title: "自动更新订阅", subtitle: "按照每个订阅单独设置的更新间隔检查", isOn: $model.runtimeSettings.automaticSubscriptionUpdates)
                         SettingToggle(icon: "wifi.exclamationmark", title: "网络状态提醒", subtitle: "断网、无法访问互联网、节点失效或内核停止时，在菜单栏图标旁弹出提示", isOn: Binding(get: { model.networkAlertsEnabled }, set: model.setNetworkAlertsEnabled))
-                        SettingToggle(icon: "arrow.triangle.2.circlepath", title: "节点失效时自动切换", subtitle: "经代理连续访问失败时，自动测速并切换到延迟最低的可用节点", isOn: Binding(get: { model.autoSwitchNodeEnabled }, set: model.setAutoSwitchNodeEnabled))
+                        SettingToggle(icon: "arrow.triangle.2.circlepath", title: "节点失效时自动切换", subtitle: "节点连不上或延迟过高时，自动测速并切换到更快的可用节点", isOn: Binding(get: { model.autoSwitchNodeEnabled }, set: model.setAutoSwitchNodeEnabled))
+                        if model.autoSwitchNodeEnabled {
+                            SettingsRow(icon: "speedometer", title: "延迟上限", subtitle: "当前节点连续两次超过此延迟，自动换到明显更快的节点") {
+                                Picker("", selection: Binding(get: { model.highLatencyThreshold }, set: model.setHighLatencyThreshold)) {
+                                    Text("关闭").tag(0)
+                                    Text("500 ms").tag(500)
+                                    Text("800 ms").tag(800)
+                                    Text("1000 ms").tag(1_000)
+                                    Text("1500 ms").tag(1_500)
+                                    Text("2000 ms").tag(2_000)
+                                }.labelsHidden().frame(width: 110)
+                            }
+                        }
+                        SettingToggle(icon: "calendar.badge.clock", title: "订阅到期与流量提醒", subtitle: "到期前 3 天、流量剩余 10% 时在菜单栏图标旁提醒一次", isOn: Binding(get: { model.subscriptionRemindersEnabled }, set: model.setSubscriptionRemindersEnabled))
                     }
                     SettingsGroup(title: "流量接管") {
                         SettingsRow(icon: "checkmark.shield", title: "系统实际状态", subtitle: model.detectedCaptureMode?.rawValue ?? (model.isConnected && model.runtimeSettings.captureMode == .tun ? "TUN（由内核接管）" : "未启用")) {
@@ -3283,8 +3457,35 @@ struct MenuBarContent: View {
                 Spacer()
             }
             ModePicker(selection: model.modeBinding)
-            HStack { Text(model.selectedNode.countryCode); VStack(alignment: .leading, spacing: 1) { Text(model.selectedNode.name).font(.system(size: 11, weight: .semibold)); Text("\(model.selectedNode.latency) ms").font(.system(size: 9)).foregroundStyle(Theme.secondary) }; Spacer(); Text(String(format: "↓ %.1f MB/s", model.downloadRate)).font(.system(size: 9, design: .monospaced)).foregroundStyle(Theme.accent) }.padding(10).background(Theme.panel).clipShape(RoundedRectangle(cornerRadius: 10))
+            HStack(spacing: 8) {
+                Text(model.selectedNode.countryCode)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(model.selectedNode.name)
+                        .font(.system(size: 11, weight: .semibold))
+                        .lineLimit(1).truncationMode(.middle)
+                    Text(model.selectedNode.latency > 0 ? "\(model.selectedNode.latency) ms · \(model.selectedProxyGroup)" : model.selectedProxyGroup)
+                        .font(.system(size: 9))
+                        .foregroundStyle(latencyColor(model.selectedNode.latency))
+                        .lineLimit(1)
+                }
+                .help("\(model.selectedProxyGroup) → \(model.selectedNode.name)")
+                Spacer(minLength: 6)
+                VStack(alignment: .trailing, spacing: 1) {
+                    Text("↑ \(model.rateText(model.uploadRate))").foregroundStyle(Theme.accent2)
+                    Text("↓ \(model.rateText(model.downloadRate))").foregroundStyle(Theme.accent)
+                }
+                .font(.system(size: 9, design: .monospaced))
+                .fixedSize()
+            }.padding(10).background(Theme.panel).clipShape(RoundedRectangle(cornerRadius: 10))
             Button { model.toggleConnection() } label: { Label(model.isConnected ? "关闭系统代理" : "开启系统代理", systemImage: "power").font(.system(size: 11, weight: .bold)).frame(maxWidth: .infinity).frame(height: 34).background(model.isConnected ? Theme.panelStrong : Theme.accent).foregroundStyle(model.isConnected ? Theme.text : Theme.onAccent).clipShape(RoundedRectangle(cornerRadius: 9)) }.buttonStyle(.plain)
         }.padding(14).frame(width: 270).background(Theme.bg)
+    }
+
+    private func latencyColor(_ latency: Int) -> Color {
+        guard latency > 0 else { return Theme.secondary }
+        let limit = model.highLatencyThreshold > 0 ? model.highLatencyThreshold : 1_000
+        if latency >= limit { return Theme.danger }
+        if latency >= limit / 2 { return Theme.warning }
+        return Theme.secondary
     }
 }
