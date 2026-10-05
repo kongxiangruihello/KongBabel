@@ -343,18 +343,41 @@ struct TrayContextMenuView: View {
                     TrayMenuRow(title: "暂无可用代理组", symbol: "network.slash", disabled: true)
                 } else {
                     ForEach(model.proxyGroups) { group in
-                        Button {
-                            expandedProxyGroup = expandedProxyGroup == group.name ? nil : group.name
-                        } label: {
-                            TrayMenuRow(
-                                title: group.name,
-                                detail: group.now,
-                                symbol: "server.rack",
-                                showsChevron: true,
-                                expanded: expandedProxyGroup == group.name
-                            )
+                        HStack(spacing: 0) {
+                            Button {
+                                expandedProxyGroup = expandedProxyGroup == group.name ? nil : group.name
+                            } label: {
+                                TrayMenuRow(
+                                    title: group.name,
+                                    detail: group.now,
+                                    symbol: "server.rack",
+                                    showsChevron: true,
+                                    expanded: expandedProxyGroup == group.name,
+                                    status: nodeStatusColor(group.now)
+                                )
+                            }
+                            .buttonStyle(TrayMenuButtonStyle())
+                            .help(nodeStatusText(group.now))
+
+                            Button {
+                                model.testGroupLatency(group.name)
+                            } label: {
+                                Group {
+                                    if model.testingGroups.contains(group.name) {
+                                        ProgressView().controlSize(.mini)
+                                    } else {
+                                        Image(systemName: "bolt.horizontal.circle")
+                                            .font(.system(size: 13))
+                                            .foregroundStyle(Theme.secondary)
+                                    }
+                                }
+                                .frame(width: 30, height: 34)
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(model.coreState != .running || model.testingGroups.contains(group.name))
+                            .help("测速这一组")
                         }
-                        .buttonStyle(TrayMenuButtonStyle())
 
                         if expandedProxyGroup == group.name {
                             let memberList = VStack(spacing: 0) {

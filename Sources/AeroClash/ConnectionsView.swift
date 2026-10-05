@@ -12,7 +12,7 @@ struct ConnectionsView: View {
     var items: [ConnectionItem] { model.connections.filter { (!onlyActive || $0.status == .active) && (query.isEmpty || $0.host.localizedCaseInsensitiveContains(query) || $0.app.localizedCaseInsensitiveContains(query)) } }
     var body: some View {
         VStack(spacing: 0) {
-            PageHeader(title: "连接", subtitle: "检查当前网络会话与流量") {
+            PageHeader(title: "连接", subtitle: "检查当前网络会话与流量 · 右键连接可设置网站或应用走代理/直连") {
                 HStack(spacing: 10) { PillButton(title: "关闭全部", icon: "xmark.circle", action: model.closeAllConnections); StatusBadge() }
             }
             HStack(spacing: 12) {
@@ -37,10 +37,61 @@ struct ConnectionsView: View {
                                     Image(systemName: "xmark").font(.system(size: 9, weight: .bold)).foregroundStyle(Theme.secondary)
                                 }.buttonStyle(.plain).frame(width: 24).help("关闭此连接")
                             }.font(.system(size: 10)).padding(.horizontal, 15).frame(height: 52).overlay(alignment: .bottom) { Divider().overlay(Theme.stroke) }
+                            .contentShape(Rectangle())
+                            .contextMenu { ConnectionRuleMenu(item: item) }
                         }
                     }
                 }
             }.card(0).padding(.horizontal, 30).padding(.bottom, 26)
+        }
+    }
+}
+
+/// 连接右键菜单：一键把网站或应用设为始终走代理/直连
+struct ConnectionRuleMenu: View {
+    @EnvironmentObject var model: AppModel
+    let item: ConnectionItem
+
+    private var siteRule: (type: String, payload: String, label: String)? {
+        if let domain = AppModel.ruleDomain(for: item.host) {
+            return ("DOMAIN-SUFFIX", domain, "网站 \(domain)")
+        }
+        if AppModel.isIPAddress(item.host) {
+            let cidr = item.host.contains(":") ? "\(item.host)/128" : "\(item.host)/32"
+            return (item.host.contains(":") ? "IP-CIDR6" : "IP-CIDR", cidr, "地址 \(item.host)")
+        }
+        return nil
+    }
+
+    private var appRule: (type: String, payload: String, label: String)? {
+        guard item.app != "网络进程", !item.app.isEmpty else { return nil }
+        return ("PROCESS-NAME", item.app, "应用 \(item.app)")
+    }
+
+    var body: some View {
+        if let rule = siteRule { ruleSection(rule) }
+        if let rule = appRule { ruleSection(rule) }
+        Divider()
+        Button("复制目标地址") {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(item.host, forType: .string)
+        }
+        Button("关闭此连接") { model.closeConnection(id: item.id) }
+    }
+
+    @ViewBuilder
+    private func ruleSection(_ rule: (type: String, payload: String, label: String)) -> some View {
+        let current = model.quickRuleTarget(type: rule.type, payload: rule.payload)
+        Section(rule.label) {
+            Button(current != nil && current != "DIRECT" ? "✓ 始终走代理" : "始终走代理") {
+                model.addQuickRule(type: rule.type, payload: rule.payload, policy: .proxy)
+            }
+            Button(current == "DIRECT" ? "✓ 始终直连" : "始终直连") {
+                model.addQuickRule(type: rule.type, payload: rule.payload, policy: .direct)
+            }
+            if current != nil {
+                Button("删除这条规则") { model.removeQuickRules(type: rule.type, payload: rule.payload) }
+            }
         }
     }
 }
