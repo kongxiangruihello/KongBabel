@@ -454,11 +454,6 @@ struct TrayContextMenuView: View {
                 .buttonStyle(TrayMenuButtonStyle())
                 .disabled(model.coreState != .running || model.latencyTesting)
 
-                Button { openSection(.connections) } label: {
-                    TrayMenuRow(title: "连接查看器", shortcut: "⇧⌘D", symbol: "arrow.triangle.branch")
-                }
-                .buttonStyle(TrayMenuButtonStyle())
-
                 TrayMenuDivider()
 
                 Button { profilesExpanded.toggle() } label: {
