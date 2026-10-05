@@ -291,7 +291,7 @@ struct NetworkNotice: Identifiable, Equatable {
         NetworkNotice(issue: issue, style: .recovery, title: title, detail: detail, symbol: "checkmark.circle.fill", actions: [])
     }
 
-    static func info(title: String, detail: String) -> NetworkNotice {
-        NetworkNotice(issue: nil, style: .info, title: title, detail: detail, symbol: "arrow.triangle.2.circlepath.circle.fill", actions: [])
+    static func info(title: String, detail: String, symbol: String = "arrow.triangle.2.circlepath.circle.fill") -> NetworkNotice {
+        NetworkNotice(issue: nil, style: .info, title: title, detail: detail, symbol: symbol, actions: [])
     }
 }

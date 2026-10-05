@@ -22,13 +22,7 @@ cp -X "${SCRIPT_DIR}/Info.plist" "${CONTENTS_DIR}/Info.plist"
 
 for arch in arm64 x86_64; do
   xcrun swiftc \
-    "${SCRIPT_DIR}/Sources/AeroClash/main.swift" \
-    "${SCRIPT_DIR}/Sources/AeroClash/Runtime.swift" \
-    "${SCRIPT_DIR}/Sources/AeroClash/AdvancedSettings.swift" \
-    "${SCRIPT_DIR}/Sources/AeroClash/SubscriptionFormatter.swift" \
-    "${SCRIPT_DIR}/Sources/AeroClash/SubscriptionDownloader.swift" \
-    "${SCRIPT_DIR}/Sources/AeroClash/NetworkWatchdog.swift" \
-    "${SCRIPT_DIR}/Sources/AeroClash/AppInfo.swift" \
+    "${SCRIPT_DIR}"/Sources/AeroClash/*.swift \
     -o "${SCRIPT_DIR}/.build/KongBabel-${arch}" \
     -framework SwiftUI \
     -framework AppKit \
@@ -36,6 +30,7 @@ for arch in arm64 x86_64; do
     -framework CoreImage \
     -framework Security \
     -framework Network \
+    -framework Carbon \
     -parse-as-library \
     -sdk "${SDK_PATH}" \
     -module-cache-path "${MODULE_CACHE_DIR}" \
