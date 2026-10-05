@@ -119,7 +119,7 @@ extension AppModel {
             var fastest: (name: String, delay: Int)?
             var fastestFavorite: (name: String, delay: Int)?
             for (name, value) in delays {
-                guard name != previous, !excluded.contains(name.uppercased()), !excludedNodes.contains(name),
+                guard name != previous, !excluded.contains(name.uppercased()), !excludedNodes.contains(name), !Self.isInfoNodeName(name),
                       let delay = (value as? NSNumber)?.intValue, delay > 0 else { continue }
                 if fastest == nil || delay < fastest!.delay { fastest = (name, delay) }
                 if favoriteNodes.contains(name), fastestFavorite == nil || delay < fastestFavorite!.delay { fastestFavorite = (name, delay) }
@@ -361,7 +361,7 @@ extension AppModel {
     /// 记录一次策略组测速：组内测速失败的节点不会出现在结果里，按失败计
     func recordGroupDelays(_ delays: [String: Any], members: [String]) {
         let special: Set<String> = ["DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE", "GLOBAL"]
-        for member in members where !special.contains(member.uppercased()) {
+        for member in members where !special.contains(member.uppercased()) && !Self.isInfoNodeName(member) {
             recordNodeDelay(member, delay: (delays[member] as? NSNumber)?.intValue)
         }
         saveNodeStats()

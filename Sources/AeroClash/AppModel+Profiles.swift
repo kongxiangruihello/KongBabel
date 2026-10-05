@@ -268,4 +268,31 @@ extension AppModel {
             presentError("YAML 校验失败", error)
         }
     }
+
+    /// 快捷面板第一行显示的订阅到期与剩余流量；isUrgent 表示 7 天内到期或流量剩余不足 10%
+    var subscriptionSummary: (text: String, isUrgent: Bool)? {
+        if let profile = profiles.first(where: { $0.id == activeProfileID }), let usage = usage(for: profile) {
+            var parts: [String] = []
+            var urgent = false
+            if let expiresAt = usage.expiresAt {
+                let formatter = DateFormatter()
+                formatter.dateFormat = "yyyy-MM-dd"
+                let days = Int((expiresAt.timeIntervalSinceNow / 86_400).rounded(.up))
+                parts.append(days > 0 ? "有效期至 \(formatter.string(from: expiresAt))（还有 \(days) 天）" : "已于 \(formatter.string(from: expiresAt)) 到期")
+                urgent = days <= 7
+            }
+            if usage.totalBytes > 0 {
+                let remaining = max(0, usage.totalBytes - usage.usedBytes)
+                parts.append("剩余 \(ByteCountFormatter.string(fromByteCount: remaining, countStyle: .decimal))")
+                if Double(remaining) / Double(usage.totalBytes) <= 0.1 { urgent = true }
+            }
+            if !parts.isEmpty { return (parts.joined(separator: " · "), urgent) }
+        }
+        // 订阅没有提供到期信息时，退而使用订阅里的“信息节点”名称，例如“有效期2029-11-09, 剩余85.40 GB”
+        let infoNames = proxyGroups.flatMap(\.members).filter { Self.isInfoNodeName($0) }
+        if let name = infoNames.first(where: { $0.contains("有效期") || $0.contains("到期") }) ?? infoNames.first {
+            return (name, false)
+        }
+        return nil
+    }
 }

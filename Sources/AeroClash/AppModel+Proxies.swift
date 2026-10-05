@@ -329,4 +329,11 @@ extension AppModel {
         }
         return labels.suffix(2).joined(separator: ".")
     }
+
+    /// 订阅里用来显示到期日、剩余流量、官网等信息的“假节点”，不是真正可用的线路
+    static func isInfoNodeName(_ name: String) -> Bool {
+        let keywords = ["有效期", "到期", "过期", "剩余", "官网", "重置", "套餐", "expire", "traffic left", "remaining"]
+        let lower = name.lowercased()
+        return keywords.contains { lower.contains($0) }
+    }
 }
