@@ -30,6 +30,8 @@ final class AppModel: NSObject, ObservableObject {
     @Published var selectedNodeID = "DIRECT"
     @Published var selectedProxyGroup = "节点选择"
     @Published var proxyGroups: [ProxyGroup] = []
+    /// 每个节点最近一次测速的延迟（毫秒）；0 表示测速失败，没有键表示还没测过
+    @Published var proxyDelays: [String: Int] = [:]
     @Published var searchText = ""
     @Published var uploadRate = 0.0
     @Published var downloadRate = 0.0
@@ -962,6 +964,13 @@ final class AppModel: NSObject, ObservableObject {
         do {
             let data = try await api.request("/proxies")
             guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any], let rawProxies = root["proxies"] as? [String: [String: Any]] else { throw AeroRuntimeError.invalidResponse }
+            var delays: [String: Int] = [:]
+            for (name, raw) in rawProxies {
+                if let history = raw["history"] as? [[String: Any]], let last = history.last {
+                    delays[name] = (last["delay"] as? NSNumber)?.intValue ?? 0
+                }
+            }
+            proxyDelays = delays
             let groupTypes = Set(["Selector", "URLTest", "Fallback", "LoadBalance"])
             let groups = rawProxies.values.compactMap { raw -> ProxyGroup? in
                 guard let name = raw["name"] as? String, let type = raw["type"] as? String, groupTypes.contains(type), raw["hidden"] as? Bool != true else { return nil }

@@ -38,8 +38,7 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
 
         contextPopover.behavior = .transient
         contextPopover.animates = true
-        contextPopover.contentSize = NSSize(width: 340, height: 640)
-        contextPopover.contentViewController = NSHostingController(
+        let trayHost = NSHostingController(
             rootView: TrayContextMenuView(
                 openSection: { [weak self] section in self?.showMainWindow(section: section) },
                 dismiss: { [weak self] in self?.contextPopover.performClose(nil) },
@@ -51,6 +50,9 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
             .environmentObject(model)
             .preferredColorScheme(.light)
         )
+        // 弹出窗口的大小跟随内容（展开/收起节点组时自动变高变矮）
+        trayHost.sizingOptions = [.preferredContentSize]
+        contextPopover.contentViewController = trayHost
 
         noticePopover.behavior = .transient
         noticePopover.animates = true
@@ -313,8 +315,30 @@ struct TrayContextMenuView: View {
         VStack(spacing: 0) {
             quickPanel
             TrayMenuDivider()
-            ScrollView {
             VStack(spacing: 0) {
+                Button { modeExpanded.toggle() } label: {
+                    TrayMenuRow(
+                        title: "出站模式",
+                        detail: model.mode.rawValue,
+                        symbol: "point.3.filled.connected.trianglepath.dotted",
+                        showsChevron: true,
+                        expanded: modeExpanded
+                    )
+                }
+                .buttonStyle(TrayMenuButtonStyle())
+
+                if modeExpanded {
+                    ForEach(ProxyMode.allCases) { mode in
+                        Button {
+                            model.setMode(mode)
+                            dismiss()
+                        } label: {
+                            TrayMenuRow(title: mode.rawValue, checked: model.mode == mode, indented: true)
+                        }
+                        .buttonStyle(TrayMenuButtonStyle())
+                    }
+                }
+
                 if model.proxyGroups.isEmpty {
                     TrayMenuRow(title: "暂无可用代理组", symbol: "network.slash", disabled: true)
                 } else {
@@ -333,14 +357,23 @@ struct TrayContextMenuView: View {
                         .buttonStyle(TrayMenuButtonStyle())
 
                         if expandedProxyGroup == group.name {
-                            ForEach(group.members, id: \.self) { member in
-                                Button {
-                                    model.selectNode(named: member, in: group.name)
-                                    dismiss()
-                                } label: {
-                                    TrayMenuRow(title: member, checked: group.now == member, indented: true)
+                            let memberList = VStack(spacing: 0) {
+                                ForEach(group.members, id: \.self) { member in
+                                    Button {
+                                        model.selectNode(named: member, in: group.name)
+                                        dismiss()
+                                    } label: {
+                                        TrayMenuRow(title: member, checked: group.now == member, indented: true, status: nodeStatusColor(member))
+                                    }
+                                    .buttonStyle(TrayMenuButtonStyle())
+                                    .help(nodeStatusText(member))
                                 }
-                                .buttonStyle(TrayMenuButtonStyle())
+                            }
+                            if group.members.count > Self.maxVisibleNodes {
+                                ScrollView(.vertical, showsIndicators: false) { memberList }
+                                    .frame(height: CGFloat(Self.maxVisibleNodes) * 34)
+                            } else {
+                                memberList
                             }
                         }
                     }
@@ -398,11 +431,6 @@ struct TrayContextMenuView: View {
                 .buttonStyle(TrayMenuButtonStyle())
                 .disabled(model.coreState != .running || model.latencyTesting)
 
-                Button { openSection(.overview) } label: {
-                    TrayMenuRow(title: "控制台", shortcut: "⌘D", symbol: "rectangle.3.group")
-                }
-                .buttonStyle(TrayMenuButtonStyle())
-
                 Button { openSection(.connections) } label: {
                     TrayMenuRow(title: "连接查看器", shortcut: "⇧⌘D", symbol: "arrow.triangle.branch")
                 }
@@ -411,26 +439,37 @@ struct TrayContextMenuView: View {
                 TrayMenuDivider()
 
                 Button { profilesExpanded.toggle() } label: {
-                    TrayMenuRow(title: "配置", symbol: "doc.on.doc", showsChevron: true, expanded: profilesExpanded)
+                    TrayMenuRow(title: "配置", symbol: "slider.horizontal.3", showsChevron: true, expanded: profilesExpanded)
                 }
                 .buttonStyle(TrayMenuButtonStyle())
 
                 if profilesExpanded {
+                    Button { openSection(.overview) } label: {
+                        TrayMenuRow(title: "控制台", shortcut: "⌘D", symbol: "rectangle.3.group", indented: true)
+                    }
+                    .buttonStyle(TrayMenuButtonStyle())
+
+                    Button { openSection(.settings) } label: {
+                        TrayMenuRow(title: "更多设置", symbol: "gearshape", indented: true)
+                    }
+                    .buttonStyle(TrayMenuButtonStyle())
+
                     ForEach(model.profiles) { profile in
                         Button {
                             model.activateProfile(profile)
                             dismiss()
                         } label: {
-                            TrayMenuRow(title: profile.name, checked: profile.id == model.activeProfileID, indented: true)
+                            TrayMenuRow(
+                                title: profile.name,
+                                detail: profile.id == model.activeProfileID ? "使用中" : nil,
+                                checked: profile.id == model.activeProfileID,
+                                symbol: "doc.text",
+                                indented: true
+                            )
                         }
                         .buttonStyle(TrayMenuButtonStyle())
                     }
                 }
-
-                Button { openSection(.settings) } label: {
-                    TrayMenuRow(title: "更多设置", symbol: "gearshape")
-                }
-                .buttonStyle(TrayMenuButtonStyle())
 
                 Button { helpExpanded.toggle() } label: {
                     TrayMenuRow(title: "帮助", symbol: "questionmark.circle", showsChevron: true, expanded: helpExpanded)
@@ -438,8 +477,14 @@ struct TrayContextMenuView: View {
                 .buttonStyle(TrayMenuButtonStyle())
 
                 if helpExpanded {
+                    Button { model.checkForUpdates(manual: true) } label: {
+                        TrayMenuRow(title: "版本", detail: versionDetail, symbol: "info.circle", indented: true)
+                    }
+                    .buttonStyle(TrayMenuButtonStyle())
+                    .help("点击检查更新")
+
                     Button { openSection(.developer) } label: {
-                        TrayMenuRow(title: "关于 KongBabel", symbol: "info.circle", indented: true)
+                        TrayMenuRow(title: "开发者", detail: "孔祥瑞", symbol: "person.crop.circle", indented: true)
                     }
                     .buttonStyle(TrayMenuButtonStyle())
                 }
@@ -452,9 +497,9 @@ struct TrayContextMenuView: View {
                 .buttonStyle(TrayMenuButtonStyle())
             }
             .padding(8)
-            }
         }
-        .frame(width: 340, height: 640)
+        .frame(width: 340)
+        .fixedSize(horizontal: false, vertical: true)
         .background(Theme.bg)
     }
 
@@ -482,30 +527,6 @@ struct TrayContextMenuView: View {
                         .lineLimit(1)
                 }
             }
-            ModePicker(selection: model.modeBinding)
-            HStack(spacing: 8) {
-                Text(model.selectedNode.countryCode)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(model.selectedNode.name)
-                        .font(.system(size: 11, weight: .semibold))
-                        .lineLimit(1).truncationMode(.middle)
-                    Text(model.selectedNode.latency > 0 ? "\(model.selectedNode.latency) ms · \(model.selectedProxyGroup)" : model.selectedProxyGroup)
-                        .font(.system(size: 9))
-                        .foregroundStyle(latencyColor(model.selectedNode.latency))
-                        .lineLimit(1)
-                }
-                .help("\(model.selectedProxyGroup) → \(model.selectedNode.name)")
-                Spacer(minLength: 6)
-                VStack(alignment: .trailing, spacing: 1) {
-                    Text("↑ \(model.rateText(model.uploadRate))").foregroundStyle(Theme.accent2)
-                    Text("↓ \(model.rateText(model.downloadRate))").foregroundStyle(Theme.accent)
-                }
-                .font(.system(size: 9, design: .monospaced))
-                .fixedSize()
-            }
-            .padding(10)
-            .background(Theme.panel)
-            .clipShape(RoundedRectangle(cornerRadius: 10))
             Button { model.toggleConnection() } label: {
                 Label(model.isConnected ? "关闭系统代理" : "开启系统代理", systemImage: "power")
                     .font(.system(size: 11, weight: .bold))
@@ -520,6 +541,33 @@ struct TrayContextMenuView: View {
         .padding(.horizontal, 14)
         .padding(.top, 12)
         .padding(.bottom, 10)
+    }
+
+    /// 展开的节点组最多直接显示的节点数，超过后该组列表可滚动
+    static let maxVisibleNodes = 16
+
+    private var versionDetail: String {
+        if let release = model.latestRelease, UpdateChecker.isNewer(release.version, than: AppInfo.version) {
+            return "\(AppInfo.version) · 有新版本 \(release.version)"
+        }
+        return AppInfo.version
+    }
+
+    private func isSpecialProxy(_ name: String) -> Bool {
+        ["DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE"].contains(name.uppercased())
+    }
+
+    /// 节点连接状态：绿色有效、红色失效、灰色还没测速
+    private func nodeStatusColor(_ name: String) -> Color? {
+        guard !isSpecialProxy(name) else { return nil }
+        guard let delay = model.proxyDelays[name] else { return Theme.secondary.opacity(0.35) }
+        return delay > 0 ? Theme.accent : Theme.danger
+    }
+
+    private func nodeStatusText(_ name: String) -> String {
+        guard !isSpecialProxy(name) else { return name }
+        guard let delay = model.proxyDelays[name] else { return "\(name)：还没有测速，可点击“延迟测速”" }
+        return delay > 0 ? "\(name)：可用，\(delay) ms" : "\(name)：最近一次测速失败"
     }
 
     private func latencyColor(_ latency: Int) -> Color {
@@ -541,6 +589,8 @@ private struct TrayMenuRow: View {
     var expanded = false
     var indented = false
     var disabled = false
+    /// 右侧的状态圆点颜色（绿色有效、红色失效、灰色未测速）；nil 表示不显示
+    var status: Color? = nil
 
     var body: some View {
         HStack(spacing: 8) {
@@ -575,6 +625,11 @@ private struct TrayMenuRow: View {
                 Text(shortcut)
                     .font(.system(size: 11, weight: .regular))
                     .foregroundStyle(Theme.secondary.opacity(0.78))
+            }
+            if let status {
+                Circle()
+                    .fill(status)
+                    .frame(width: 7, height: 7)
             }
             if showsChevron {
                 Image(systemName: "chevron.right")
