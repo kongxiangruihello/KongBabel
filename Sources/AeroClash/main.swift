@@ -67,6 +67,9 @@ final class AppModel: NSObject, ObservableObject {
     @Published var webDAVPassword: String
     @Published var webDAVBusy = false
     @Published var trafficHistory: [DailyTraffic]
+    @Published var networkAlertsEnabled = UserDefaults.standard.object(forKey: "networkAlertsEnabled") as? Bool ?? true
+    /// 菜单栏图标下方弹出的网络状态提示；nil 表示不显示。
+    @Published var networkNotice: NetworkNotice?
 
     @Published var nodes: [ProxyNode] = []
     @Published var connections: [ConnectionItem] = []
@@ -92,6 +95,8 @@ final class AppModel: NSObject, ObservableObject {
     private var pendingHistoryDownload: Int64 = 0
     private var tunRequested = false
     private var lastSubscriptionCheck = Date.distantPast
+    private let networkWatchdog = NetworkWatchdog()
+    private var networkAlertsSnoozedUntil = Date.distantPast
 
     override init() {
         let repository = ProfileRepository()
@@ -124,8 +129,12 @@ final class AppModel: NSObject, ObservableObject {
         super.init()
         NotificationCenter.default.addObserver(self, selector: #selector(applicationWillTerminate), name: NSApplication.willTerminateNotification, object: nil)
         timer = Timer.scheduledTimer(withTimeInterval: 1.6, repeats: true) { [weak self] _ in
-            Task { @MainActor in await self?.refreshRuntime() }
+            Task { @MainActor in
+                await self?.refreshRuntime()
+                self?.networkWatchdog.tick()
+            }
         }
+        configureNetworkWatchdog()
         Task { await startCore() }
     }
 
@@ -311,6 +320,7 @@ final class AppModel: NSObject, ObservableObject {
             }
             withAnimation(.spring(response: 0.38, dampingFraction: 0.82)) { isConnected = enabled }
             detectedCaptureMode = enabled ? runtimeSettings.captureMode : nil
+            networkWatchdog.recheckSoon()
             showToast(enabled ? "\(runtimeSettings.captureMode.rawValue) 已开启" : "网络设置已恢复")
         } catch {
             isConnected = false
@@ -440,6 +450,7 @@ final class AppModel: NSObject, ObservableObject {
                 let group = groupName.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? groupName
                 _ = try await api.request("/proxies/\(group)", method: "PUT", json: ["name": nodeName])
                 showToast("\(groupName) 已切换至 \(nodeName)")
+                networkWatchdog.recheckSoon()
                 await refreshProxies()
             } catch {
                 selectedProxyGroup = previousGroup
@@ -471,6 +482,7 @@ final class AppModel: NSObject, ObservableObject {
                 let group = selectedProxyGroup.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? selectedProxyGroup
                 _ = try await api.request("/proxies/\(group)", method: "PUT", json: ["name": node.name])
                 showToast("已切换至 \(node.name)")
+                networkWatchdog.recheckSoon()
                 await refreshProxies()
             } catch {
                 selectedNodeID = previous
@@ -1046,6 +1058,117 @@ final class AppModel: NSObject, ObservableObject {
         alertMessage = "\(title)：\n\n\(detail)"
     }
 
+    // MARK: Network watchdog
+
+    func setNetworkAlertsEnabled(_ enabled: Bool) {
+        networkAlertsEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: "networkAlertsEnabled")
+        networkWatchdog.isEnabled = enabled
+        if enabled {
+            networkAlertsSnoozedUntil = .distantPast
+            networkWatchdog.recheckSoon()
+        } else {
+            networkNotice = nil
+        }
+        showToast(enabled ? "已开启网络状态提醒" : "已关闭网络状态提醒")
+    }
+
+    private func configureNetworkWatchdog() {
+        networkWatchdog.isEnabled = networkAlertsEnabled
+        networkWatchdog.context = { [weak self] in
+            guard let self else {
+                return NetworkWatchdog.Context(coreState: .stopped, isCapturing: false, isDirectMode: true, proxyPort: 0)
+            }
+            return NetworkWatchdog.Context(
+                coreState: self.coreState,
+                isCapturing: self.isConnected,
+                isDirectMode: self.mode == .direct,
+                proxyPort: self.httpPort
+            )
+        }
+        networkWatchdog.onIssue = { [weak self] issue in self?.handleNetworkIssue(issue) }
+        networkWatchdog.onRecover = { [weak self] issue in self?.handleNetworkRecovery(issue) }
+        networkWatchdog.start()
+    }
+
+    private func handleNetworkIssue(_ issue: NetworkIssue) {
+        appendLog(level: "WARN", message: issue.logMessage)
+        recordDiagnostic("network-issue=\(issue)")
+        guard Date() >= networkAlertsSnoozedUntil else { return }
+        networkNotice = NetworkNotice(issue: issue, isRecovery: false, title: issue.title, detail: networkNoticeDetail(for: issue))
+    }
+
+    private func handleNetworkRecovery(_ issue: NetworkIssue) {
+        appendLog(level: "INFO", message: "网络检测：已恢复（\(issue.title)）")
+        recordDiagnostic("network-recovered=\(issue)")
+        let title = issue == .coreStopped ? "Mihomo 内核已恢复运行" : "网络已恢复连接"
+        guard Date() >= networkAlertsSnoozedUntil else {
+            showToast(title)
+            return
+        }
+        networkNotice = NetworkNotice(issue: issue, isRecovery: true, title: title, detail: currentNetworkSummary())
+    }
+
+    private func currentNetworkSummary() -> String {
+        let capture: String
+        if isConnected {
+            capture = tunRequested ? "TUN 已接管" : "\(runtimeSettings.captureMode.rawValue)已开启"
+        } else {
+            capture = "未接管系统流量"
+        }
+        return "\(mode.rawValue)模式 · \(capture) · \(selectedNodeID)"
+    }
+
+    private func networkNoticeDetail(for issue: NetworkIssue) -> String {
+        switch issue {
+        case .offline:
+            return "Mac 没有连接到任何网络（Wi‑Fi 或有线），请检查网络连接。"
+        case .internetUnreachable:
+            return "已连接网络，但无法访问互联网。校园网、酒店或公共 Wi‑Fi 可能需要先在浏览器中登录认证。"
+        case .proxyUnreachable:
+            return "本机网络正常，但经当前节点无法访问外网。\n当前节点：\(selectedProxyGroup) → \(selectedNodeID)\n节点可能失效或订阅已过期。"
+        case .coreStopped:
+            let reason: String
+            if case .failed(let message) = coreState { reason = message } else { reason = "未知原因" }
+            return "代理内核已停止，经 KongBabel 的连接将全部失败。\n原因：\(String(reason.prefix(160)))"
+        }
+    }
+
+    func performNetworkNoticeAction(_ action: NetworkNoticeAction) {
+        networkNotice = nil
+        switch action {
+        case .openNetworkSettings:
+            if let url = URL(string: "x-apple.systempreferences:com.apple.Network-Settings.extension") {
+                NSWorkspace.shared.open(url)
+            }
+        case .testAndSwitch:
+            showMainWindow(section: .proxies)
+            testLatency()
+            networkWatchdog.recheckSoon()
+        case .diagnose:
+            showMainWindow(section: .overview)
+            runNetworkDiagnostics()
+        case .restartCore:
+            Task { await startCore() }
+        case .showLogs:
+            showMainWindow(section: .logs)
+        }
+    }
+
+    func dismissNetworkNotice(snooze: Bool = false) {
+        if snooze {
+            networkAlertsSnoozedUntil = Date().addingTimeInterval(30 * 60)
+            showToast("30 分钟内不再提醒网络状态")
+        }
+        networkNotice = nil
+    }
+
+    private func showMainWindow(section: SidebarSection) {
+        selectedSection = section
+        NSApp.activate(ignoringOtherApps: true)
+        NSApp.windows.first(where: { !($0 is NSPanel) && $0.canBecomeKey })?.makeKeyAndOrderFront(nil)
+    }
+
     @objc private func applicationWillTerminate() {
         if pendingHistoryUpload > 0 || pendingHistoryDownload > 0 {
             _ = try? trafficHistoryStore.record(uploadBytes: pendingHistoryUpload, downloadBytes: pendingHistoryDownload)
@@ -1260,11 +1383,14 @@ final class KongApplicationDelegate: NSObject, NSApplicationDelegate {
 }
 
 @MainActor
-final class StatusBarController: NSObject {
+final class StatusBarController: NSObject, NSPopoverDelegate {
     private let model: AppModel
     private let statusItem: NSStatusItem
     private let popover = NSPopover()
     private let contextPopover = NSPopover()
+    private let noticePopover = NSPopover()
+    private let rateView = StatusRateView()
+    private var noticeCloseWork: DispatchWorkItem?
     private var cancellables = Set<AnyCancellable>()
     private var mainWindow: NSWindow?
 
@@ -1297,20 +1423,29 @@ final class StatusBarController: NSObject {
             .preferredColorScheme(.light)
         )
 
+        noticePopover.behavior = .transient
+        noticePopover.animates = true
+        noticePopover.delegate = self
+
         if let button = statusItem.button {
+            button.addSubview(rateView)
             button.target = self
             button.action = #selector(statusItemClicked(_:))
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
             button.imagePosition = .imageLeft
             button.imageScaling = .scaleProportionallyDown
             button.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .light)
-            button.toolTip = "Kong · 左键打开，右键显示快捷菜单"
+            button.toolTip = "KongBabel · 左键打开，右键显示快捷菜单"
         }
 
         model.$uploadRate
             .combineLatest(model.$downloadRate, model.$showMenuBarRates)
             .receive(on: RunLoop.main)
             .sink { [weak self] _, _, _ in self?.updateStatusItem() }
+            .store(in: &cancellables)
+        model.$networkNotice
+            .receive(on: RunLoop.main)
+            .sink { [weak self] notice in self?.showNetworkNotice(notice) }
             .store(in: &cancellables)
         updateStatusItem()
         DispatchQueue.main.async { [weak self] in
@@ -1324,11 +1459,55 @@ final class StatusBarController: NSObject {
 
     private func updateStatusItem() {
         guard let button = statusItem.button else { return }
-        button.image = model.menuBarIcon
-        button.image?.size = NSSize(width: 20, height: 20)
-        button.title = model.showMenuBarRates
-            ? "↓\(model.menuBarDownloadRateText) ↑\(model.menuBarUploadRateText)"
-            : ""
+        button.title = ""
+        if model.showMenuBarRates {
+            // 图标与上下两行速率都放在自绘视图里：上行在上，下行在下
+            button.image = nil
+            rateView.isHidden = false
+            rateView.update(icon: model.menuBarIcon, upload: model.menuBarUploadRateText, download: model.menuBarDownloadRateText)
+            statusItem.length = rateView.preferredWidth
+            rateView.frame = NSRect(x: 0, y: 0, width: rateView.preferredWidth, height: button.bounds.height > 0 ? button.bounds.height : NSStatusBar.system.thickness)
+        } else {
+            rateView.isHidden = true
+            statusItem.length = NSStatusItem.variableLength
+            button.image = model.menuBarIcon
+            button.image?.size = NSSize(width: 20, height: 20)
+        }
+    }
+
+    private func showNetworkNotice(_ notice: NetworkNotice?) {
+        noticeCloseWork?.cancel()
+        guard let notice, let button = statusItem.button else {
+            if noticePopover.isShown { noticePopover.performClose(nil) }
+            return
+        }
+        popover.performClose(nil)
+        contextPopover.performClose(nil)
+        let host = NSHostingController(
+            rootView: NetworkNoticeView(notice: notice)
+                .environmentObject(model)
+                .preferredColorScheme(.light)
+        )
+        noticePopover.contentViewController = host
+        host.view.layoutSubtreeIfNeeded()
+        noticePopover.contentSize = host.view.fittingSize
+        if !noticePopover.isShown {
+            noticePopover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        }
+        if notice.isRecovery {
+            // 恢复提示 4 秒后自动收起；故障提示保持显示，直到用户处理或点击别处
+            let work = DispatchWorkItem { [weak self] in
+                guard let self, self.model.networkNotice?.id == notice.id else { return }
+                self.model.dismissNetworkNotice()
+            }
+            noticeCloseWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4, execute: work)
+        }
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        guard (notification.object as? NSPopover) === noticePopover, model.networkNotice != nil else { return }
+        model.dismissNetworkNotice()
     }
 
     @objc private func statusItemClicked(_ sender: NSStatusBarButton) {
@@ -1358,6 +1537,112 @@ final class StatusBarController: NSObject {
             mainWindow = NSApp.windows.first(where: { !($0 is NSPanel) && $0.canBecomeKey })
         }
         mainWindow?.makeKeyAndOrderFront(nil)
+    }
+}
+
+/// 菜单栏中的“图标 + 上下两行速率”视图（上行在上、下行在下）。
+final class StatusRateView: NSView {
+    private let iconView = NSImageView()
+    private let uploadLabel = NSTextField(labelWithString: "")
+    private let downloadLabel = NSTextField(labelWithString: "")
+    private let iconSize: CGFloat = 21
+    private let labelWidth: CGFloat = 56
+    /// 图标与速率文字之间的间距
+    private let gap: CGFloat = 3
+
+    var preferredWidth: CGFloat { 2 + iconSize + gap + labelWidth + 4 }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        iconView.imageScaling = .scaleProportionallyUpOrDown
+        addSubview(iconView)
+        for label in [uploadLabel, downloadLabel] {
+            label.font = NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .regular)
+            label.textColor = .labelColor
+            label.alignment = .left
+            label.lineBreakMode = .byClipping
+            label.drawsBackground = false
+            label.isBezeled = false
+            addSubview(label)
+        }
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    // 让点击穿透到菜单栏按钮本身，保留左键/右键弹出面板的行为
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    func update(icon: NSImage, upload: String, download: String) {
+        iconView.image = icon
+        uploadLabel.stringValue = "↑ \(upload)"
+        downloadLabel.stringValue = "↓ \(download)"
+        needsLayout = true
+    }
+
+    override func layout() {
+        super.layout()
+        let height = bounds.height
+        iconView.frame = NSRect(x: 2, y: (height - iconSize) / 2, width: iconSize, height: iconSize)
+        let x = 2 + iconSize + gap
+        let lineHeight: CGFloat = 10
+        let top = (height + 2 * lineHeight) / 2
+        uploadLabel.frame = NSRect(x: x, y: top - lineHeight, width: labelWidth, height: lineHeight + 1)
+        downloadLabel.frame = NSRect(x: x, y: top - 2 * lineHeight, width: labelWidth, height: lineHeight + 1)
+    }
+}
+
+/// 菜单栏图标下方弹出的网络状态提示。
+struct NetworkNoticeView: View {
+    @EnvironmentObject var model: AppModel
+    let notice: NetworkNotice
+
+    var body: some View {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(alignment: .top, spacing: 10) {
+                    Image(systemName: notice.symbol)
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundStyle(tint(notice))
+                        .frame(width: 26)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(notice.title).font(.system(size: 13, weight: .bold)).foregroundStyle(Theme.text)
+                        Text(notice.detail)
+                            .font(.system(size: 11))
+                            .foregroundStyle(Theme.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer(minLength: 0)
+                    Button { model.dismissNetworkNotice() } label: {
+                        Image(systemName: "xmark").font(.system(size: 10, weight: .bold)).foregroundStyle(Theme.secondary)
+                    }.buttonStyle(.plain)
+                }
+                if !notice.actions.isEmpty {
+                    HStack(spacing: 8) {
+                        ForEach(notice.actions, id: \.self) { action in
+                            Button { model.performNetworkNoticeAction(action) } label: {
+                                Text(action.title)
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .padding(.horizontal, 10).frame(height: 26)
+                                    .background(action == notice.actions.first ? Theme.accent : Theme.panelStrong)
+                                    .foregroundStyle(action == notice.actions.first ? Theme.onAccent : Theme.text)
+                                    .clipShape(RoundedRectangle(cornerRadius: 7))
+                            }.buttonStyle(.plain)
+                        }
+                        Spacer(minLength: 0)
+                        Button("30 分钟内不提醒") { model.dismissNetworkNotice(snooze: true) }
+                            .buttonStyle(.plain)
+                            .font(.system(size: 10))
+                            .foregroundStyle(Theme.secondary)
+                    }
+                }
+            }
+            .padding(14)
+            .frame(width: 300)
+            .background(Theme.bg)
+    }
+
+    private func tint(_ notice: NetworkNotice) -> Color {
+        if notice.isRecovery { return Theme.accent }
+        return notice.issue == .proxyUnreachable ? Theme.warning : Theme.danger
     }
 }
 
@@ -2547,6 +2832,7 @@ struct SettingsView: View {
                     SettingsGroup(title: "通用") {
                         SettingToggle(icon: "power", title: "登录时启动", subtitle: "使用 macOS 原生登录项目运行 Kong", isOn: Binding(get: { model.launchAtLogin }, set: model.setLaunchAtLogin))
                         SettingToggle(icon: "arrow.clockwise", title: "自动更新订阅", subtitle: "按照每个订阅单独设置的更新间隔检查", isOn: $model.runtimeSettings.automaticSubscriptionUpdates)
+                        SettingToggle(icon: "wifi.exclamationmark", title: "网络状态提醒", subtitle: "断网、无法访问互联网、节点失效或内核停止时，在菜单栏图标旁弹出提示", isOn: Binding(get: { model.networkAlertsEnabled }, set: model.setNetworkAlertsEnabled))
                     }
                     SettingsGroup(title: "流量接管") {
                         SettingsRow(icon: "checkmark.shield", title: "系统实际状态", subtitle: model.detectedCaptureMode?.rawValue ?? (model.isConnected && model.runtimeSettings.captureMode == .tun ? "TUN（由内核接管）" : "未启用")) {

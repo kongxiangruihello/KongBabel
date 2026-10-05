@@ -3,10 +3,10 @@ set -euo pipefail
 
 SCRIPT_DIR="${0:A:h}"
 OUTPUT_DIR="${SCRIPT_DIR}/../../outputs"
-APP_DIR="${OUTPUT_DIR}/Kong.app"
+APP_DIR="${OUTPUT_DIR}/KongBabel.app"
 STAGING_ROOT="$(mktemp -d /private/tmp/kong-build.XXXXXX)"
 trap 'rm -rf "${STAGING_ROOT}"' EXIT
-STAGING_APP_DIR="${STAGING_ROOT}/Kong.app"
+STAGING_APP_DIR="${STAGING_ROOT}/KongBabel.app"
 CONTENTS_DIR="${STAGING_APP_DIR}/Contents"
 MACOS_DIR="${CONTENTS_DIR}/MacOS"
 RESOURCES_DIR="${CONTENTS_DIR}/Resources"
@@ -27,12 +27,14 @@ for arch in arm64 x86_64; do
     "${SCRIPT_DIR}/Sources/AeroClash/AdvancedSettings.swift" \
     "${SCRIPT_DIR}/Sources/AeroClash/SubscriptionFormatter.swift" \
     "${SCRIPT_DIR}/Sources/AeroClash/SubscriptionDownloader.swift" \
-    -o "${SCRIPT_DIR}/.build/Kong-${arch}" \
+    "${SCRIPT_DIR}/Sources/AeroClash/NetworkWatchdog.swift" \
+    -o "${SCRIPT_DIR}/.build/KongBabel-${arch}" \
     -framework SwiftUI \
     -framework AppKit \
     -framework ServiceManagement \
     -framework CoreImage \
     -framework Security \
+    -framework Network \
     -parse-as-library \
     -sdk "${SDK_PATH}" \
     -module-cache-path "${MODULE_CACHE_DIR}" \
@@ -41,13 +43,13 @@ for arch in arm64 x86_64; do
 done
 
 lipo -create \
-  "${SCRIPT_DIR}/.build/Kong-arm64" \
-  "${SCRIPT_DIR}/.build/Kong-x86_64" \
-  -output "${MACOS_DIR}/Kong"
+  "${SCRIPT_DIR}/.build/KongBabel-arm64" \
+  "${SCRIPT_DIR}/.build/KongBabel-x86_64" \
+  -output "${MACOS_DIR}/KongBabel"
 
-sips -z 1024 1024 "${SCRIPT_DIR}/Assets/ConfuciusIcon.png" --out "${SCRIPT_DIR}/.build/AppIcon.png" >/dev/null
-sips -z 20 20 "${SCRIPT_DIR}/Assets/ConfuciusMenuBarIcon.png" --out "${SCRIPT_DIR}/.build/MenuBarIcon.png" >/dev/null
-sips -z 40 40 "${SCRIPT_DIR}/Assets/ConfuciusMenuBarIcon.png" --out "${SCRIPT_DIR}/.build/MenuBarIcon@2x.png" >/dev/null
+sips -z 1024 1024 "${SCRIPT_DIR}/Assets/KongBabelIcon.png" --out "${SCRIPT_DIR}/.build/AppIcon.png" >/dev/null
+sips -z 22 22 "${SCRIPT_DIR}/Assets/KongBabelMenuBarIcon.png" --out "${SCRIPT_DIR}/.build/MenuBarIcon.png" >/dev/null
+sips -z 44 44 "${SCRIPT_DIR}/Assets/KongBabelMenuBarIcon.png" --out "${SCRIPT_DIR}/.build/MenuBarIcon@2x.png" >/dev/null
 
 cp -X "${SCRIPT_DIR}/.build/AppIcon.png" "${RESOURCES_DIR}/AppIcon.png"
 cp -X "${SCRIPT_DIR}/.build/MenuBarIcon.png" "${RESOURCES_DIR}/MenuBarIcon.png"
@@ -61,12 +63,12 @@ cp -X "${SCRIPT_DIR}/Mihomo-NOTICE.txt" "${RESOURCES_DIR}/Mihomo-NOTICE.txt"
 cp -X "${SCRIPT_DIR}/Mihomo-LICENSE.txt" "${RESOURCES_DIR}/Mihomo-LICENSE.txt"
 xattr -cr "${STAGING_APP_DIR}"
 codesign --force --deep --sign - "${STAGING_APP_DIR}" >/dev/null
-ditto -c -k --sequesterRsrc --keepParent "${STAGING_APP_DIR}" "${STAGING_ROOT}/Kong-macOS.zip"
+ditto -c -k --sequesterRsrc --keepParent "${STAGING_APP_DIR}" "${STAGING_ROOT}/KongBabel-macOS.zip"
 if [[ -e "${APP_DIR}" ]]; then
   rm -rf "${APP_DIR}"
 fi
 ditto --norsrc --noextattr --noacl "${STAGING_APP_DIR}" "${APP_DIR}"
 xattr -cr "${APP_DIR}"
 codesign --force --deep --sign - "${APP_DIR}" >/dev/null
-cp -X "${STAGING_ROOT}/Kong-macOS.zip" "${OUTPUT_DIR}/Kong-macOS.zip"
+cp -X "${STAGING_ROOT}/KongBabel-macOS.zip" "${OUTPUT_DIR}/KongBabel-macOS.zip"
 echo "Built ${APP_DIR}"
