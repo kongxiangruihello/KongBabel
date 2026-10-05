@@ -37,16 +37,38 @@ struct SettingsView: View {
                         SettingToggle(icon: "command", title: "全局快捷键", subtitle: "在任何应用中都可使用以下快捷键", isOn: Binding(get: { model.globalHotKeysEnabled }, set: model.setGlobalHotKeysEnabled))
                         if model.globalHotKeysEnabled {
                             ForEach(KongHotKey.allCases) { key in
-                                SettingsRow(icon: "keyboard", title: key.title, subtitle: model.unavailableHotKeys.contains(key.rawValue) ? "已被其他应用占用，暂不可用" : "全局可用") {
-                                    Text(key.display)
-                                        .font(.system(size: 12, weight: .semibold, design: .rounded))
-                                        .padding(.horizontal, 8).padding(.vertical, 3)
-                                        .background(Theme.panelStrong).clipShape(RoundedRectangle(cornerRadius: 6))
-                                        .foregroundStyle(model.unavailableHotKeys.contains(key.rawValue) ? Theme.danger : Theme.text)
+                                let recording = model.recordingHotKey == key
+                                let unavailable = model.unavailableHotKeys.contains(key.rawValue)
+                                SettingsRow(icon: "keyboard", title: key.title, subtitle: recording ? "请按下新的组合键，按 Esc 取消" : unavailable ? "已被其他应用占用，点击右侧按键换一个" : "点击右侧按键可修改") {
+                                    HStack(spacing: 8) {
+                                        if model.isCustomHotKey(key) && !recording {
+                                            Button("恢复默认") { model.resetHotKey(key) }
+                                                .buttonStyle(.plain)
+                                                .font(.system(size: 10))
+                                                .foregroundStyle(Theme.secondary)
+                                        }
+                                        Button {
+                                            if recording { model.stopRecordingHotKey() } else { model.beginRecordingHotKey(key) }
+                                        } label: {
+                                            Text(recording ? "按下快捷键…" : model.hotKeyBinding(for: key).display)
+                                                .font(.system(size: 12, weight: .semibold, design: .rounded))
+                                                .padding(.horizontal, 8).padding(.vertical, 3)
+                                                .frame(minWidth: 64)
+                                                .background(recording ? Theme.accent.opacity(0.15) : Theme.panelStrong)
+                                                .clipShape(RoundedRectangle(cornerRadius: 6))
+                                                .overlay(RoundedRectangle(cornerRadius: 6).stroke(recording ? Theme.accent : .clear))
+                                                .foregroundStyle(unavailable && !recording ? Theme.danger : Theme.text)
+                                        }
+                                        .buttonStyle(.plain)
+                                    }
                                 }
                             }
                         }
                         SettingToggle(icon: "calendar.badge.clock", title: "订阅到期与流量提醒", subtitle: "到期前 3 天、流量剩余 10% 时在菜单栏图标旁提醒一次", isOn: Binding(get: { model.subscriptionRemindersEnabled }, set: model.setSubscriptionRemindersEnabled))
+                        SettingToggle(icon: "arrow.down.circle", title: "自动检查更新", subtitle: "每天检查一次 GitHub 上是否有新版本", isOn: Binding(get: { model.autoUpdateCheckEnabled }, set: model.setAutoUpdateCheckEnabled))
+                        SettingsRow(icon: "shippingbox", title: "当前版本 \(AppInfo.version)", subtitle: model.latestRelease.map { "GitHub 最新版本：\($0.version)" } ?? "点击右侧按钮立即检查") {
+                            PillButton(title: model.updateCheckInProgress ? "检查中" : "检查更新", icon: "arrow.clockwise") { model.checkForUpdates(manual: true) }
+                        }
                     }
                     SettingsGroup(title: "流量接管") {
                         SettingsRow(icon: "checkmark.shield", title: "系统实际状态", subtitle: model.detectedCaptureMode?.rawValue ?? (model.isConnected && model.runtimeSettings.captureMode == .tun ? "TUN（由内核接管）" : "未启用")) {

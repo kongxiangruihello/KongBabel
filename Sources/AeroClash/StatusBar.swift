@@ -24,7 +24,6 @@ final class KongApplicationDelegate: NSObject, NSApplicationDelegate {
 final class StatusBarController: NSObject, NSPopoverDelegate {
     private let model: AppModel
     private let statusItem: NSStatusItem
-    private let popover = NSPopover()
     private let contextPopover = NSPopover()
     private let noticePopover = NSPopover()
     private let rateView = StatusRateView()
@@ -37,17 +36,9 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         super.init()
 
-        popover.behavior = .transient
-        popover.animates = true
-        popover.contentSize = NSSize(width: 270, height: 205)
-        popover.contentViewController = NSHostingController(
-            rootView: MenuBarContent()
-                .environmentObject(model)
-                .preferredColorScheme(.light)
-        )
         contextPopover.behavior = .transient
         contextPopover.animates = true
-        contextPopover.contentSize = NSSize(width: 340, height: 590)
+        contextPopover.contentSize = NSSize(width: 340, height: 640)
         contextPopover.contentViewController = NSHostingController(
             rootView: TrayContextMenuView(
                 openSection: { [weak self] section in self?.showMainWindow(section: section) },
@@ -73,7 +64,7 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
             button.imagePosition = .imageLeft
             button.imageScaling = .scaleProportionallyDown
             button.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .light)
-            button.toolTip = "KongBabel · 左键打开，右键显示快捷菜单"
+            button.toolTip = "KongBabel · 点击打开快捷面板"
         }
 
         model.$uploadRate
@@ -113,7 +104,7 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
         )
         statusItem.length = rateView.preferredWidth
         rateView.frame = NSRect(x: 0, y: 0, width: rateView.preferredWidth, height: button.bounds.height > 0 ? button.bounds.height : NSStatusBar.system.thickness)
-        button.toolTip = issue.map { "KongBabel · \($0.title)" } ?? "KongBabel · 左键打开，右键显示快捷菜单"
+        button.toolTip = issue.map { "KongBabel · \($0.title)" } ?? "KongBabel · 点击打开快捷面板"
     }
 
     private func showNetworkNotice(_ notice: NetworkNotice?) {
@@ -122,7 +113,6 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
             if noticePopover.isShown { noticePopover.performClose(nil) }
             return
         }
-        popover.performClose(nil)
         contextPopover.performClose(nil)
         let host = NSHostingController(
             rootView: NetworkNoticeView(notice: notice)
@@ -152,26 +142,18 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
     }
 
     @objc private func statusItemClicked(_ sender: NSStatusBarButton) {
-        if NSApp.currentEvent?.type == .rightMouseUp {
-            popover.performClose(nil)
-            if contextPopover.isShown {
-                contextPopover.performClose(nil)
-            } else {
-                contextPopover.show(relativeTo: sender.bounds, of: sender, preferredEdge: .minY)
-                contextPopover.contentViewController?.view.window?.makeKey()
-            }
-        } else if popover.isShown {
-            popover.performClose(nil)
-        } else {
+        // 左键、右键都打开同一个快捷面板
+        if contextPopover.isShown {
             contextPopover.performClose(nil)
-            popover.show(relativeTo: sender.bounds, of: sender, preferredEdge: .minY)
-            popover.contentViewController?.view.window?.makeKey()
+        } else {
+            if noticePopover.isShown { noticePopover.performClose(nil) }
+            contextPopover.show(relativeTo: sender.bounds, of: sender, preferredEdge: .minY)
+            contextPopover.contentViewController?.view.window?.makeKey()
         }
     }
 
     func showMainWindow(section: SidebarSection? = nil) {
         if let section { model.selectedSection = section }
-        popover.performClose(nil)
         contextPopover.performClose(nil)
         NSApp.activate(ignoringOtherApps: true)
         if mainWindow == nil {
@@ -311,7 +293,7 @@ struct NetworkNoticeView: View {
         case .failure: return Theme.danger
         case .warning: return Theme.warning
         case .recovery: return Theme.accent
-        case .info: return Theme.accent2
+        case .info, .update: return Theme.accent2
         }
     }
 }
@@ -328,33 +310,11 @@ struct TrayContextMenuView: View {
     @StoredState private var helpExpanded = false
 
     var body: some View {
-        ScrollView {
+        VStack(spacing: 0) {
+            quickPanel
+            TrayMenuDivider()
+            ScrollView {
             VStack(spacing: 0) {
-                header
-                TrayMenuDivider()
-
-                Button { modeExpanded.toggle() } label: {
-                    TrayMenuRow(
-                        title: "出站模式（\(model.mode.rawValue)）",
-                        symbol: "point.3.filled.connected.trianglepath.dotted",
-                        showsChevron: true,
-                        expanded: modeExpanded
-                    )
-                }
-                .buttonStyle(TrayMenuButtonStyle())
-
-                if modeExpanded {
-                    ForEach(ProxyMode.allCases) { mode in
-                        Button {
-                            model.setMode(mode)
-                            dismiss()
-                        } label: {
-                            TrayMenuRow(title: mode.rawValue, checked: model.mode == mode, indented: true)
-                        }
-                        .buttonStyle(TrayMenuButtonStyle())
-                    }
-                }
-
                 if model.proxyGroups.isEmpty {
                     TrayMenuRow(title: "暂无可用代理组", symbol: "network.slash", disabled: true)
                 } else {
@@ -387,19 +347,6 @@ struct TrayContextMenuView: View {
                 }
 
                 TrayMenuDivider()
-
-                Button {
-                    model.toggleConnection()
-                    dismiss()
-                } label: {
-                    TrayMenuRow(
-                        title: "设置为系统代理",
-                        shortcut: "⌘S",
-                        checked: model.isConnected,
-                        symbol: model.isConnected ? nil : "power"
-                    )
-                }
-                .buttonStyle(TrayMenuButtonStyle())
 
                 Button {
                     model.copyTerminalProxyCommand()
@@ -505,34 +452,82 @@ struct TrayContextMenuView: View {
                 .buttonStyle(TrayMenuButtonStyle())
             }
             .padding(8)
+            }
         }
-        .frame(width: 340, height: 590)
+        .frame(width: 340, height: 640)
         .background(Theme.bg)
     }
 
-    private var header: some View {
-        HStack(spacing: 11) {
-            Image(nsImage: NSApplication.shared.applicationIconImage)
-                .resizable()
-                .scaledToFit()
-                .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
-                .frame(width: 30, height: 30)
-            VStack(alignment: .leading, spacing: 1) {
-                Text("KongBabel")
-                    .font(.system(size: 13, weight: .bold))
-                    .foregroundStyle(Theme.text)
-                Text(model.isConnected ? "\(model.runtimeSettings.captureMode.rawValue)已开启" : "流量接管已关闭")
-                    .font(.system(size: 10))
-                    .foregroundStyle(Theme.secondary)
+    private var quickPanel: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 11) {
+                Image(nsImage: NSApplication.shared.applicationIconImage)
+                    .resizable()
+                    .scaledToFit()
+                    .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                    .frame(width: 30, height: 30)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("KongBabel")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(Theme.text)
+                    Text(model.isConnected ? "\(model.runtimeSettings.captureMode.rawValue)已开启" : "流量接管已关闭")
+                        .font(.system(size: 10))
+                        .foregroundStyle(Theme.secondary)
+                }
+                Spacer()
+                if let issue = model.networkIssueBadge {
+                    Label(issue.title, systemImage: "exclamationmark.circle.fill")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(issue == .proxyUnreachable ? Theme.warning : Theme.danger)
+                        .lineLimit(1)
+                }
             }
-            Spacer()
-            Text("↓\(model.menuBarDownloadRateText)  ↑\(model.menuBarUploadRateText)")
-                .font(.system(size: 10, weight: .regular, design: .monospaced))
-                .foregroundStyle(Theme.secondary)
-                .lineLimit(1)
+            ModePicker(selection: model.modeBinding)
+            HStack(spacing: 8) {
+                Text(model.selectedNode.countryCode)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(model.selectedNode.name)
+                        .font(.system(size: 11, weight: .semibold))
+                        .lineLimit(1).truncationMode(.middle)
+                    Text(model.selectedNode.latency > 0 ? "\(model.selectedNode.latency) ms · \(model.selectedProxyGroup)" : model.selectedProxyGroup)
+                        .font(.system(size: 9))
+                        .foregroundStyle(latencyColor(model.selectedNode.latency))
+                        .lineLimit(1)
+                }
+                .help("\(model.selectedProxyGroup) → \(model.selectedNode.name)")
+                Spacer(minLength: 6)
+                VStack(alignment: .trailing, spacing: 1) {
+                    Text("↑ \(model.rateText(model.uploadRate))").foregroundStyle(Theme.accent2)
+                    Text("↓ \(model.rateText(model.downloadRate))").foregroundStyle(Theme.accent)
+                }
+                .font(.system(size: 9, design: .monospaced))
+                .fixedSize()
+            }
+            .padding(10)
+            .background(Theme.panel)
+            .clipShape(RoundedRectangle(cornerRadius: 10))
+            Button { model.toggleConnection() } label: {
+                Label(model.isConnected ? "关闭系统代理" : "开启系统代理", systemImage: "power")
+                    .font(.system(size: 11, weight: .bold))
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 32)
+                    .background(model.isConnected ? Theme.panelStrong : Theme.accent)
+                    .foregroundStyle(model.isConnected ? Theme.text : Theme.onAccent)
+                    .clipShape(RoundedRectangle(cornerRadius: 9))
+            }
+            .buttonStyle(.plain)
         }
-        .padding(.horizontal, 10)
-        .frame(height: 48)
+        .padding(.horizontal, 14)
+        .padding(.top, 12)
+        .padding(.bottom, 10)
+    }
+
+    private func latencyColor(_ latency: Int) -> Color {
+        guard latency > 0 else { return Theme.secondary }
+        let limit = model.highLatencyThreshold > 0 ? model.highLatencyThreshold : 1_000
+        if latency >= limit { return Theme.danger }
+        if latency >= limit / 2 { return Theme.warning }
+        return Theme.secondary
     }
 }
 
@@ -612,52 +607,5 @@ private struct TrayMenuButtonStyle: ButtonStyle {
             .frame(maxWidth: .infinity)
             .background(configuration.isPressed ? Theme.panelStrong : Color.clear)
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-    }
-}
-
-struct MenuBarContent: View {
-    @EnvironmentObject var model: AppModel
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Image(nsImage: NSApplication.shared.applicationIconImage).resizable().scaledToFit()
-                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous)).frame(width: 32, height: 32)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("KongBabel").font(.system(size: 14, weight: .bold))
-                    Text(model.isConnected ? "\(model.runtimeSettings.captureMode.rawValue)已开启" : "流量接管已关闭").font(.system(size: 10)).foregroundStyle(Theme.secondary)
-                }
-                Spacer()
-            }
-            ModePicker(selection: model.modeBinding)
-            HStack(spacing: 8) {
-                Text(model.selectedNode.countryCode)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(model.selectedNode.name)
-                        .font(.system(size: 11, weight: .semibold))
-                        .lineLimit(1).truncationMode(.middle)
-                    Text(model.selectedNode.latency > 0 ? "\(model.selectedNode.latency) ms · \(model.selectedProxyGroup)" : model.selectedProxyGroup)
-                        .font(.system(size: 9))
-                        .foregroundStyle(latencyColor(model.selectedNode.latency))
-                        .lineLimit(1)
-                }
-                .help("\(model.selectedProxyGroup) → \(model.selectedNode.name)")
-                Spacer(minLength: 6)
-                VStack(alignment: .trailing, spacing: 1) {
-                    Text("↑ \(model.rateText(model.uploadRate))").foregroundStyle(Theme.accent2)
-                    Text("↓ \(model.rateText(model.downloadRate))").foregroundStyle(Theme.accent)
-                }
-                .font(.system(size: 9, design: .monospaced))
-                .fixedSize()
-            }.padding(10).background(Theme.panel).clipShape(RoundedRectangle(cornerRadius: 10))
-            Button { model.toggleConnection() } label: { Label(model.isConnected ? "关闭系统代理" : "开启系统代理", systemImage: "power").font(.system(size: 11, weight: .bold)).frame(maxWidth: .infinity).frame(height: 34).background(model.isConnected ? Theme.panelStrong : Theme.accent).foregroundStyle(model.isConnected ? Theme.text : Theme.onAccent).clipShape(RoundedRectangle(cornerRadius: 9)) }.buttonStyle(.plain)
-        }.padding(14).frame(width: 270).background(Theme.bg)
-    }
-
-    private func latencyColor(_ latency: Int) -> Color {
-        guard latency > 0 else { return Theme.secondary }
-        let limit = model.highLatencyThreshold > 0 ? model.highLatencyThreshold : 1_000
-        if latency >= limit { return Theme.danger }
-        if latency >= limit / 2 { return Theme.warning }
-        return Theme.secondary
     }
 }

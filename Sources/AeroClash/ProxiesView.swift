@@ -74,6 +74,11 @@ struct ProxyNodeCard: View {
                 GeometryReader { geo in
                     ZStack(alignment: .leading) { Capsule().fill(Theme.panelStrong); Capsule().fill(latencyColor.opacity(0.75)).frame(width: geo.size.width * node.load) }
                 }.frame(height: 3)
+                Text((model.nodeStats[node.name] ?? NodeStats()).compactSummary)
+                    .font(.system(size: 9))
+                    .foregroundStyle(Theme.secondary)
+                    .lineLimit(1)
+                    .help((model.nodeStats[node.name] ?? NodeStats()).fullSummary)
             }.padding(15).background(selected ? Theme.accent.opacity(0.085) : Theme.panel).clipShape(RoundedRectangle(cornerRadius: 14)).overlay(RoundedRectangle(cornerRadius: 14).stroke(selected ? Theme.accent.opacity(0.65) : Theme.stroke, lineWidth: 1))
             .opacity(model.isExcluded(node.name) ? 0.6 : 1)
         }

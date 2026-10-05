@@ -114,6 +114,7 @@ extension AppModel {
             let testURL = "https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204"
             let data = try await api.request("/group/\(encoded)/delay?url=\(testURL)&timeout=5000")
             let delays = (try JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+            recordGroupDelays(delays, members: group.members)
             let excluded: Set<String> = ["DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE"]
             var fastest: (name: String, delay: Int)?
             var fastestFavorite: (name: String, delay: Int)?
@@ -172,6 +173,7 @@ extension AppModel {
             case .highLatency: reasonText = "延迟过高"
             case .manual: reasonText = "快捷键手动切换"
             }
+            recordNodeSwitchedAway(previous)
             recordNetworkEvent(.autoSwitch, title: "切换节点：\(best.name)",
                                detail: "\(reasonText) · \(group.name)：\(previous) → \(best.name)（\(best.delay) ms）")
             if isManual || Date() >= networkAlertsSnoozedUntil {
@@ -209,7 +211,10 @@ extension AppModel {
         let node = group.now
         Task {
             defer { latencyCheckInFlight = false }
-            guard let delay = await measureDelay(of: node) else { return } // 连不通由网络监测处理
+            let measured = await measureDelay(of: node)
+            recordNodeDelay(node, delay: measured)
+            saveNodeStats()
+            guard let delay = measured else { return } // 连不通由网络监测处理
             guard delay > highLatencyThreshold else {
                 highLatencyStrikes = 0
                 return
@@ -305,10 +310,11 @@ extension AppModel {
         unavailableHotKeys = []
         guard globalHotKeysEnabled else { return }
         for key in KongHotKey.allCases {
-            let ok = hotKeys.register(key) { [weak self] in self?.performHotKey(key) }
+            let binding = hotKeyBinding(for: key)
+            let ok = hotKeys.register(key, binding: binding) { [weak self] in self?.performHotKey(key) }
             if !ok {
                 unavailableHotKeys.insert(key.rawValue)
-                appendLog(level: "WARN", message: "全局快捷键 \(key.display) 已被其他应用占用")
+                appendLog(level: "WARN", message: "全局快捷键 \(binding.display) 已被其他应用占用")
             }
         }
     }
@@ -335,6 +341,177 @@ extension AppModel {
             guard coreState == .running, !autoSwitchInProgress else { return }
             networkNotice = .info(title: "正在测速…", detail: "正在为当前策略组测速，完成后切换到最快的节点。", symbol: "speedometer")
             Task { await autoSwitch(reason: .manual) }
+        }
+    }
+
+    // MARK: Node stability
+
+    /// 记录一次测速结果：delay 为 nil 或 0 表示失败
+    func recordNodeDelay(_ name: String, delay: Int?) {
+        var stats = nodeStats[name] ?? NodeStats()
+        if let delay, delay > 0 {
+            stats.samples.append(.init(date: Date(), delay: delay))
+        } else {
+            stats.failures.append(Date())
+        }
+        stats.prune()
+        nodeStats[name] = stats
+    }
+
+    /// 记录一次策略组测速：组内测速失败的节点不会出现在结果里，按失败计
+    func recordGroupDelays(_ delays: [String: Any], members: [String]) {
+        let special: Set<String> = ["DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE", "GLOBAL"]
+        for member in members where !special.contains(member.uppercased()) {
+            recordNodeDelay(member, delay: (delays[member] as? NSNumber)?.intValue)
+        }
+        saveNodeStats()
+    }
+
+    func recordNodeSwitchedAway(_ name: String) {
+        var stats = nodeStats[name] ?? NodeStats()
+        stats.switchedAway.append(Date())
+        stats.prune()
+        nodeStats[name] = stats
+        saveNodeStats()
+    }
+
+    func saveNodeStats() {
+        nodeStatsStore.save(nodeStats)
+    }
+
+    // MARK: Custom hot keys
+
+    func hotKeyBinding(for key: KongHotKey) -> HotKeyBinding {
+        hotKeyBindings[key.rawValue] ?? key.defaultBinding
+    }
+
+    func isCustomHotKey(_ key: KongHotKey) -> Bool {
+        hotKeyBindings[key.rawValue] != nil
+    }
+
+    /// 开始录制：暂停全局快捷键，等待用户在设置页按下新组合（Esc 取消）
+    func beginRecordingHotKey(_ key: KongHotKey) {
+        stopRecordingHotKey(reconfigure: false)
+        recordingHotKey = key
+        GlobalHotKeys.shared.unregisterAll()
+        hotKeyRecorder = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self else { return event }
+            return self.handleHotKeyRecording(event)
+        }
+    }
+
+    func stopRecordingHotKey(reconfigure: Bool = true) {
+        if let monitor = hotKeyRecorder { NSEvent.removeMonitor(monitor) }
+        hotKeyRecorder = nil
+        recordingHotKey = nil
+        if reconfigure { configureGlobalHotKeys() }
+    }
+
+    func resetHotKey(_ key: KongHotKey) {
+        hotKeyBindings[key.rawValue] = nil
+        saveHotKeyBindings()
+        configureGlobalHotKeys()
+        showToast("已恢复默认快捷键 \(key.display)")
+    }
+
+    func handleHotKeyRecording(_ event: NSEvent) -> NSEvent? {
+        guard let key = recordingHotKey else { return event }
+        if event.keyCode == 53 { // Esc
+            stopRecordingHotKey()
+            return nil
+        }
+        let flags = event.modifierFlags.intersection([.command, .option, .control, .shift])
+        guard !flags.intersection([.command, .option, .control]).isEmpty else {
+            NSSound.beep()
+            showToast("快捷键需要包含 ⌘、⌥ 或 ⌃ 中的至少一个")
+            return nil
+        }
+        let newBinding = HotKeyBinding(
+            keyCode: UInt32(event.keyCode),
+            modifiers: HotKeyBinding.carbonModifiers(from: flags),
+            display: HotKeyBinding.displayString(flags: flags, keyCode: event.keyCode, characters: event.charactersIgnoringModifiers)
+        )
+        if let other = KongHotKey.allCases.first(where: { $0 != key && hotKeyBinding(for: $0).sameKeys(as: newBinding) }) {
+            NSSound.beep()
+            showToast("\(newBinding.display) 已用于“\(other.title)”")
+            return nil
+        }
+        hotKeyBindings[key.rawValue] = newBinding.sameKeys(as: key.defaultBinding) ? nil : newBinding
+        saveHotKeyBindings()
+        stopRecordingHotKey()
+        if unavailableHotKeys.contains(key.rawValue) {
+            showToast("\(newBinding.display) 已被其他应用占用，请换一个")
+        } else {
+            showToast("“\(key.title)”已改为 \(newBinding.display)")
+        }
+        return nil
+    }
+
+    func saveHotKeyBindings() {
+        var saved: [String: HotKeyBinding] = [:]
+        for (id, binding) in hotKeyBindings { saved[String(id)] = binding }
+        if let data = try? JSONEncoder().encode(saved) {
+            UserDefaults.standard.set(data, forKey: "hotKeyBindings")
+        }
+    }
+
+    // MARK: Update check
+
+    func setAutoUpdateCheckEnabled(_ enabled: Bool) {
+        autoUpdateCheckEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: "autoUpdateCheckEnabled")
+        if enabled { lastUpdateCheckAttempt = .distantPast }
+        showToast(enabled ? "将每天自动检查更新" : "已关闭自动检查更新")
+    }
+
+    /// 启动 1 分钟后检查一次，之后每天一次；失败后 1 小时内不重试
+    func checkForUpdatesIfNeeded() {
+        guard autoUpdateCheckEnabled, !updateCheckInProgress,
+              let startedAt = coreStartedAt, Date().timeIntervalSince(startedAt) > 60,
+              Date().timeIntervalSince(lastUpdateCheckAttempt) > 3_600 else { return }
+        let lastSuccess = UserDefaults.standard.object(forKey: "lastUpdateCheck") as? Date ?? .distantPast
+        guard Date().timeIntervalSince(lastSuccess) > 86_400 else { return }
+        checkForUpdates(manual: false)
+    }
+
+    func checkForUpdates(manual: Bool) {
+        guard !updateCheckInProgress else { return }
+        updateCheckInProgress = true
+        lastUpdateCheckAttempt = Date()
+        Task {
+            defer { updateCheckInProgress = false }
+            do {
+                guard let release = try await UpdateChecker.fetchLatest() else {
+                    UserDefaults.standard.set(Date(), forKey: "lastUpdateCheck")
+                    if manual {
+                        networkNotice = .info(title: "暂无发布版本", detail: "GitHub 上还没有发布过 KongBabel 的版本。可以用 ./build.sh --release 发布。", symbol: "shippingbox.fill")
+                    }
+                    return
+                }
+                UserDefaults.standard.set(Date(), forKey: "lastUpdateCheck")
+                guard UpdateChecker.isNewer(release.version, than: AppInfo.version) else {
+                    latestRelease = release
+                    if manual {
+                        networkNotice = .info(title: "已是最新版本", detail: "当前版本 \(AppInfo.version)，GitHub 上最新为 \(release.version)。", symbol: "checkmark.seal.fill")
+                    }
+                    return
+                }
+                latestRelease = release
+                let skipped = UserDefaults.standard.string(forKey: "skippedUpdateVersion")
+                guard manual || skipped != release.version else { return }
+                let notes = release.notes.trimmingCharacters(in: .whitespacesAndNewlines)
+                var detail = "当前版本 \(AppInfo.version)，可升级到 \(release.version)。"
+                if !notes.isEmpty { detail += "\n" + String(notes.prefix(160)) }
+                networkNotice = NetworkNotice(
+                    issue: nil, style: .update, title: "发现新版本 \(release.version)", detail: detail,
+                    symbol: "arrow.down.circle.fill",
+                    actions: [.downloadUpdate(url: (release.downloadURL ?? release.pageURL).absoluteString), .skipVersion(release.version)]
+                )
+            } catch {
+                if manual {
+                    networkNotice = .info(title: "检查更新失败", detail: error.localizedDescription, symbol: "exclamationmark.circle.fill")
+                }
+            }
         }
     }
 
@@ -460,6 +637,11 @@ extension AppModel {
             if let profile = profiles.first(where: { $0.id == profileID }) { updateProfile(profile) }
         case .openProfiles:
             showMainWindow(section: .profiles)
+        case .downloadUpdate(let url):
+            if let target = URL(string: url) { NSWorkspace.shared.open(target) }
+        case .skipVersion(let version):
+            UserDefaults.standard.set(version, forKey: "skippedUpdateVersion")
+            showToast("已跳过 \(version)，有更新的版本时会再提醒")
         }
     }
 

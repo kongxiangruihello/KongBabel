@@ -77,6 +77,14 @@ final class AppModel: NSObject, ObservableObject {
     @Published var globalHotKeysEnabled = UserDefaults.standard.object(forKey: "globalHotKeysEnabled") as? Bool ?? true
     @Published var unavailableHotKeys: Set<UInt32> = []
     @Published var networkEvents: [NetworkEvent]
+    /// 各节点近 7 天的稳定性记录
+    @Published var nodeStats: [String: NodeStats]
+    /// 用户自定义的全局快捷键（键为 KongHotKey.rawValue）；未自定义的用默认组合
+    @Published var hotKeyBindings: [UInt32: HotKeyBinding]
+    @Published var recordingHotKey: KongHotKey?
+    @Published var autoUpdateCheckEnabled = UserDefaults.standard.object(forKey: "autoUpdateCheckEnabled") as? Bool ?? true
+    @Published var latestRelease: ReleaseInfo?
+    @Published var updateCheckInProgress = false
 
     @Published var nodes: [ProxyNode] = []
     @Published var connections: [ConnectionItem] = []
@@ -94,6 +102,9 @@ final class AppModel: NSObject, ObservableObject {
     let webDAVClient = WebDAVClient()
     let trafficHistoryStore: TrafficHistoryStore
     let networkEventStore: NetworkEventStore
+    let nodeStatsStore: NodeStatsStore
+    var hotKeyRecorder: Any?
+    var lastUpdateCheckAttempt = Date.distantPast
     var networkIssueStartedAt: Date?
     var refreshCounter = 0
     var isRefreshing = false
@@ -138,6 +149,19 @@ final class AppModel: NSObject, ObservableObject {
         let networkEventStore = NetworkEventStore(root: repository.root)
         self.networkEventStore = networkEventStore
         self.networkEvents = networkEventStore.load()
+        let nodeStatsStore = NodeStatsStore(root: repository.root)
+        self.nodeStatsStore = nodeStatsStore
+        self.nodeStats = nodeStatsStore.load()
+        if let data = UserDefaults.standard.data(forKey: "hotKeyBindings"),
+           let saved = try? JSONDecoder().decode([String: HotKeyBinding].self, from: data) {
+            var bindings: [UInt32: HotKeyBinding] = [:]
+            for entry in saved {
+                if let id = UInt32(entry.key) { bindings[id] = entry.value }
+            }
+            self.hotKeyBindings = bindings
+        } else {
+            self.hotKeyBindings = [:]
+        }
         let loadedProfiles = repository.loadProfiles()
         self.profiles = loadedProfiles
         let savedID = UserDefaults.standard.string(forKey: "activeProfileID")
@@ -152,6 +176,7 @@ final class AppModel: NSObject, ObservableObject {
                 self?.networkWatchdog.tick()
                 self?.checkLatencyIfNeeded()
                 self?.checkSubscriptionReminders()
+                self?.checkForUpdatesIfNeeded()
             }
         }
         configureNetworkWatchdog()
@@ -298,7 +323,11 @@ final class AppModel: NSObject, ObservableObject {
             do {
                 let group = selectedProxyGroup.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? selectedProxyGroup
                 let testURL = "https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204"
-                _ = try await api.request("/group/\(group)/delay?url=\(testURL)&timeout=5000")
+                let data = try await api.request("/group/\(group)/delay?url=\(testURL)&timeout=5000")
+                if let delays = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let tested = proxyGroups.first(where: { $0.name == selectedProxyGroup }) {
+                    recordGroupDelays(delays, members: tested.members)
+                }
                 await refreshProxies()
                 latencyTesting = false
                 let available = nodes.filter { $0.latency > 0 }.count

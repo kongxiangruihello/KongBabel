@@ -233,6 +233,8 @@ enum NetworkNoticeAction: Hashable {
     case showLogs
     case updateSubscription(profileID: String)
     case openProfiles
+    case downloadUpdate(url: String)
+    case skipVersion(String)
 
     var title: String {
         switch self {
@@ -243,6 +245,8 @@ enum NetworkNoticeAction: Hashable {
         case .showLogs: return "查看日志"
         case .updateSubscription: return "更新订阅"
         case .openProfiles: return "查看配置"
+        case .downloadUpdate: return "前往下载"
+        case .skipVersion: return "跳过此版本"
         }
     }
 }
@@ -254,6 +258,7 @@ struct NetworkNotice: Identifiable, Equatable {
         case warning   // 橙色：需要注意
         case recovery  // 绿色：已恢复
         case info      // 蓝色：提示性消息
+        case update    // 蓝色：发现新版本（保持显示）
     }
 
     let id = UUID()
@@ -270,7 +275,7 @@ struct NetworkNotice: Identifiable, Equatable {
         switch style {
         case .recovery: return 4
         case .info: return 6
-        case .failure, .warning: return nil
+        case .failure, .warning, .update: return nil
         }
     }
 
