@@ -28,6 +28,7 @@ for arch in arm64 x86_64; do
     "${SCRIPT_DIR}/Sources/AeroClash/SubscriptionFormatter.swift" \
     "${SCRIPT_DIR}/Sources/AeroClash/SubscriptionDownloader.swift" \
     "${SCRIPT_DIR}/Sources/AeroClash/NetworkWatchdog.swift" \
+    "${SCRIPT_DIR}/Sources/AeroClash/AppInfo.swift" \
     -o "${SCRIPT_DIR}/.build/KongBabel-${arch}" \
     -framework SwiftUI \
     -framework AppKit \

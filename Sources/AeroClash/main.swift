@@ -19,7 +19,7 @@ final class AppModel: NSObject, ObservableObject {
            let bundledImage = NSImage(contentsOf: url) {
             image = bundledImage
         } else {
-            image = NSImage(systemSymbolName: "person.crop.circle.fill", accessibilityDescription: "Kong")
+            image = NSImage(systemSymbolName: "person.crop.circle.fill", accessibilityDescription: "KongBabel")
                 ?? NSApplication.shared.applicationIconImage
         }
         image.size = NSSize(width: 20, height: 20)
@@ -70,6 +70,9 @@ final class AppModel: NSObject, ObservableObject {
     @Published var networkAlertsEnabled = UserDefaults.standard.object(forKey: "networkAlertsEnabled") as? Bool ?? true
     /// 菜单栏图标下方弹出的网络状态提示；nil 表示不显示。
     @Published var networkNotice: NetworkNotice?
+    /// 当前未恢复的网络故障，用于菜单栏图标上的状态小圆点；nil 表示网络正常。
+    @Published var networkIssueBadge: NetworkIssue?
+    @Published var autoSwitchNodeEnabled = UserDefaults.standard.object(forKey: "autoSwitchNodeEnabled") as? Bool ?? true
 
     @Published var nodes: [ProxyNode] = []
     @Published var connections: [ConnectionItem] = []
@@ -97,6 +100,8 @@ final class AppModel: NSObject, ObservableObject {
     private var lastSubscriptionCheck = Date.distantPast
     private let networkWatchdog = NetworkWatchdog()
     private var networkAlertsSnoozedUntil = Date.distantPast
+    private var autoSwitchInProgress = false
+    private var lastAutoSwitchAttempt = Date.distantPast
 
     override init() {
         let repository = ProfileRepository()
@@ -382,7 +387,7 @@ final class AppModel: NSObject, ObservableObject {
     func restoreFromWebDAV() {
         guard !webDAVBusy else { return }
         let alert = NSAlert()
-        alert.messageText = "从 WebDAV 恢复 Kong？"
+        alert.messageText = "从 WebDAV 恢复 KongBabel？"
         alert.informativeText = "将恢复配置、订阅偏好和网络覆写设置。当前配置会先保留本地备份。"
         alert.addButton(withTitle: "恢复")
         alert.addButton(withTitle: "取消")
@@ -575,7 +580,7 @@ final class AppModel: NSObject, ObservableObject {
                 let detected = systemProxy.status(httpPort: httpPort, socksPort: socksPort, pacURL: repository.pacURL)
                 detectedCaptureMode = detected
                 if isConnected, runtimeSettings.captureMode != .tun, detected != runtimeSettings.captureMode {
-                    throw AeroRuntimeError.commandFailed("系统实际接管状态与 Kong 显示状态不一致")
+                    throw AeroRuntimeError.commandFailed("系统实际接管状态与 KongBabel 显示状态不一致")
                 }
                 let capture = tunRequested ? "TUN" : (detected?.rawValue ?? "未接管系统流量")
                 showToast("诊断通过 · 内核、端口与\(capture)状态正常")
@@ -1069,8 +1074,15 @@ final class AppModel: NSObject, ObservableObject {
             networkWatchdog.recheckSoon()
         } else {
             networkNotice = nil
+            networkIssueBadge = nil
         }
         showToast(enabled ? "已开启网络状态提醒" : "已关闭网络状态提醒")
+    }
+
+    func setAutoSwitchNodeEnabled(_ enabled: Bool) {
+        autoSwitchNodeEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: "autoSwitchNodeEnabled")
+        showToast(enabled ? "节点失效时将自动切换" : "已关闭自动切换节点")
     }
 
     private func configureNetworkWatchdog() {
@@ -1094,11 +1106,83 @@ final class AppModel: NSObject, ObservableObject {
     private func handleNetworkIssue(_ issue: NetworkIssue) {
         appendLog(level: "WARN", message: issue.logMessage)
         recordDiagnostic("network-issue=\(issue)")
+        networkIssueBadge = issue
+        if issue == .proxyUnreachable, autoSwitchNodeEnabled, !autoSwitchInProgress,
+           Date().timeIntervalSince(lastAutoSwitchAttempt) > 120 {
+            Task { await autoSwitchAfterFailure() }
+            return
+        }
+        presentIssueNotice(issue)
+    }
+
+    private func presentIssueNotice(_ issue: NetworkIssue, extraDetail: String? = nil) {
         guard Date() >= networkAlertsSnoozedUntil else { return }
-        networkNotice = NetworkNotice(issue: issue, isRecovery: false, title: issue.title, detail: networkNoticeDetail(for: issue))
+        var detail = networkNoticeDetail(for: issue)
+        if let extraDetail { detail += "\n\(extraDetail)" }
+        networkNotice = NetworkNotice(issue: issue, isRecovery: false, title: issue.title, detail: detail)
+    }
+
+    /// 代理不可用时：对当前策略组测速，切换到延迟最低的可用节点。
+    private func autoSwitchAfterFailure() async {
+        autoSwitchInProgress = true
+        lastAutoSwitchAttempt = Date()
+        defer { autoSwitchInProgress = false }
+        let previous = selectedNodeID
+        guard let group = autoSwitchTargetGroup() else {
+            presentIssueNotice(.proxyUnreachable, extraDetail: "当前策略组不支持手动切换，未能自动更换节点。")
+            return
+        }
+        appendLog(level: "INFO", message: "自动切换：正在为“\(group.name)”测速")
+        do {
+            let encoded = group.name.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? group.name
+            let testURL = "https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204"
+            let data = try await api.request("/group/\(encoded)/delay?url=\(testURL)&timeout=5000")
+            let delays = (try JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+            let excluded: Set<String> = ["DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE"]
+            var best: (name: String, delay: Int)?
+            for (name, value) in delays {
+                guard name != group.now, !excluded.contains(name.uppercased()),
+                      let delay = (value as? NSNumber)?.intValue, delay > 0 else { continue }
+                if best == nil || delay < best!.delay { best = (name, delay) }
+            }
+            guard let best else {
+                await refreshProxies()
+                presentIssueNotice(.proxyUnreachable, extraDetail: "已对“\(group.name)”全部节点测速，没有找到可用节点，可能需要更新订阅。")
+                return
+            }
+            _ = try await api.request("/proxies/\(encoded)", method: "PUT", json: ["name": best.name])
+            selectedProxyGroup = group.name
+            await refreshProxies()
+            appendLog(level: "INFO", message: "自动切换：\(group.name) 由 \(previous) 切换至 \(best.name)（\(best.delay) ms）")
+            recordDiagnostic("auto-switch=\(group.name):\(best.name)")
+            networkWatchdog.retryAfterRemedy()
+            if Date() >= networkAlertsSnoozedUntil {
+                networkNotice = NetworkNotice(
+                    issue: .proxyUnreachable,
+                    isRecovery: false,
+                    title: "已自动切换节点",
+                    detail: "原节点“\(previous)”无法访问外网，已切换到“\(best.name)”（\(best.delay) ms）。正在重新检测网络…",
+                    isInfo: true
+                )
+            } else {
+                showToast("已自动切换到 \(best.name)")
+            }
+        } catch {
+            appendLog(level: "WARN", message: "自动切换失败：\(error.localizedDescription)")
+            presentIssueNotice(.proxyUnreachable, extraDetail: "自动切换失败：\(error.localizedDescription)")
+        }
+    }
+
+    /// 选择要切换的策略组：只处理可手动选择的 Selector 组。
+    private func autoSwitchTargetGroup() -> ProxyGroup? {
+        let selectors = proxyGroups.filter { $0.type == "Selector" && !$0.members.isEmpty }
+        if mode == .global { return selectors.first { $0.name == "GLOBAL" } }
+        if let current = selectors.first(where: { $0.name == selectedProxyGroup && $0.name != "GLOBAL" }) { return current }
+        return selectors.first { $0.name != "GLOBAL" }
     }
 
     private func handleNetworkRecovery(_ issue: NetworkIssue) {
+        networkIssueBadge = nil
         appendLog(level: "INFO", message: "网络检测：已恢复（\(issue.title)）")
         recordDiagnostic("network-recovered=\(issue)")
         let title = issue == .coreStopped ? "Mihomo 内核已恢复运行" : "网络已恢复连接"
@@ -1443,6 +1527,10 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
             .receive(on: RunLoop.main)
             .sink { [weak self] _, _, _ in self?.updateStatusItem() }
             .store(in: &cancellables)
+        model.$networkIssueBadge
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.updateStatusItem() }
+            .store(in: &cancellables)
         model.$networkNotice
             .receive(on: RunLoop.main)
             .sink { [weak self] notice in self?.showNetworkNotice(notice) }
@@ -1460,19 +1548,18 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
     private func updateStatusItem() {
         guard let button = statusItem.button else { return }
         button.title = ""
-        if model.showMenuBarRates {
-            // 图标与上下两行速率都放在自绘视图里：上行在上，下行在下
-            button.image = nil
-            rateView.isHidden = false
-            rateView.update(icon: model.menuBarIcon, upload: model.menuBarUploadRateText, download: model.menuBarDownloadRateText)
-            statusItem.length = rateView.preferredWidth
-            rateView.frame = NSRect(x: 0, y: 0, width: rateView.preferredWidth, height: button.bounds.height > 0 ? button.bounds.height : NSStatusBar.system.thickness)
-        } else {
-            rateView.isHidden = true
-            statusItem.length = NSStatusItem.variableLength
-            button.image = model.menuBarIcon
-            button.image?.size = NSSize(width: 20, height: 20)
-        }
+        button.image = nil
+        let issue = model.networkIssueBadge
+        rateView.update(
+            icon: model.menuBarIcon,
+            upload: model.menuBarUploadRateText,
+            download: model.menuBarDownloadRateText,
+            showsRates: model.showMenuBarRates,
+            badge: issue.map { $0 == .proxyUnreachable ? NSColor.systemOrange : NSColor.systemRed }
+        )
+        statusItem.length = rateView.preferredWidth
+        rateView.frame = NSRect(x: 0, y: 0, width: rateView.preferredWidth, height: button.bounds.height > 0 ? button.bounds.height : NSStatusBar.system.thickness)
+        button.toolTip = issue.map { "KongBabel · \($0.title)" } ?? "KongBabel · 左键打开，右键显示快捷菜单"
     }
 
     private func showNetworkNotice(_ notice: NetworkNotice?) {
@@ -1494,14 +1581,14 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
         if !noticePopover.isShown {
             noticePopover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         }
-        if notice.isRecovery {
-            // 恢复提示 4 秒后自动收起；故障提示保持显示，直到用户处理或点击别处
+        if notice.isRecovery || notice.isInfo {
+            // 恢复/提示性消息几秒后自动收起；故障提示保持显示，直到用户处理或点击别处
             let work = DispatchWorkItem { [weak self] in
                 guard let self, self.model.networkNotice?.id == notice.id else { return }
                 self.model.dismissNetworkNotice()
             }
             noticeCloseWork = work
-            DispatchQueue.main.asyncAfter(deadline: .now() + 4, execute: work)
+            DispatchQueue.main.asyncAfter(deadline: .now() + (notice.isInfo ? 6 : 4), execute: work)
         }
     }
 
@@ -1545,19 +1632,28 @@ final class StatusRateView: NSView {
     private let iconView = NSImageView()
     private let uploadLabel = NSTextField(labelWithString: "")
     private let downloadLabel = NSTextField(labelWithString: "")
-    private let iconSize: CGFloat = 21
-    private let labelWidth: CGFloat = 56
+    private let badgeView = NSView()
+    private var showsRates = true
+    private let iconSize: CGFloat = 20
+    private let rateFont = NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .regular)
+    /// 速率文字宽度按实际内容计算，避免短文字后面留出大段空白
+    private var labelWidth: CGFloat = 40
     /// 图标与速率文字之间的间距
     private let gap: CGFloat = 3
 
-    var preferredWidth: CGFloat { 2 + iconSize + gap + labelWidth + 4 }
+    var preferredWidth: CGFloat { showsRates ? 2 + iconSize + gap + labelWidth + 1 : 2 + iconSize + 2 }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         iconView.imageScaling = .scaleProportionallyUpOrDown
+        // 与速率文字使用同一种颜色，避免图标显得发灰
+        iconView.contentTintColor = .labelColor
         addSubview(iconView)
+        badgeView.wantsLayer = true
+        badgeView.layer?.cornerRadius = 3.5
+        badgeView.isHidden = true
         for label in [uploadLabel, downloadLabel] {
-            label.font = NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .regular)
+            label.font = rateFont
             label.textColor = .labelColor
             label.alignment = .left
             label.lineBreakMode = .byClipping
@@ -1565,6 +1661,7 @@ final class StatusRateView: NSView {
             label.isBezeled = false
             addSubview(label)
         }
+        addSubview(badgeView)
     }
 
     required init?(coder: NSCoder) { nil }
@@ -1572,10 +1669,20 @@ final class StatusRateView: NSView {
     // 让点击穿透到菜单栏按钮本身，保留左键/右键弹出面板的行为
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
-    func update(icon: NSImage, upload: String, download: String) {
+    func update(icon: NSImage, upload: String, download: String, showsRates: Bool, badge: NSColor?) {
+        self.showsRates = showsRates
         iconView.image = icon
         uploadLabel.stringValue = "↑ \(upload)"
         downloadLabel.stringValue = "↓ \(download)"
+        // NSTextField 左右各有约 2pt 内边距
+        let textWidth = [uploadLabel.stringValue, downloadLabel.stringValue]
+            .map { ($0 as NSString).size(withAttributes: [.font: rateFont]).width }
+            .max() ?? 0
+        labelWidth = ceil(textWidth) + 4
+        uploadLabel.isHidden = !showsRates
+        downloadLabel.isHidden = !showsRates
+        badgeView.isHidden = badge == nil
+        badgeView.layer?.backgroundColor = badge?.cgColor
         needsLayout = true
     }
 
@@ -1588,6 +1695,9 @@ final class StatusRateView: NSView {
         let top = (height + 2 * lineHeight) / 2
         uploadLabel.frame = NSRect(x: x, y: top - lineHeight, width: labelWidth, height: lineHeight + 1)
         downloadLabel.frame = NSRect(x: x, y: top - 2 * lineHeight, width: labelWidth, height: lineHeight + 1)
+        // 状态小圆点位于图标右上角
+        let badgeSize: CGFloat = 7
+        badgeView.frame = NSRect(x: 2 + iconSize - badgeSize + 1, y: (height + iconSize) / 2 - badgeSize, width: badgeSize, height: badgeSize)
     }
 }
 
@@ -1822,7 +1932,7 @@ struct TrayContextMenuView: View {
 
                 if helpExpanded {
                     Button { openSection(.developer) } label: {
-                        TrayMenuRow(title: "关于 Kong", symbol: "info.circle", indented: true)
+                        TrayMenuRow(title: "关于 KongBabel", symbol: "info.circle", indented: true)
                     }
                     .buttonStyle(TrayMenuButtonStyle())
                 }
@@ -1830,7 +1940,7 @@ struct TrayContextMenuView: View {
                 TrayMenuDivider()
 
                 Button(action: quit) {
-                    TrayMenuRow(title: "退出 Kong", shortcut: "⌘Q", symbol: "power")
+                    TrayMenuRow(title: "退出 KongBabel", shortcut: "⌘Q", symbol: "power")
                 }
                 .buttonStyle(TrayMenuButtonStyle())
             }
@@ -1848,7 +1958,7 @@ struct TrayContextMenuView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
                 .frame(width: 30, height: 30)
             VStack(alignment: .leading, spacing: 1) {
-                Text("Kong")
+                Text("KongBabel")
                     .font(.system(size: 13, weight: .bold))
                     .foregroundStyle(Theme.text)
                 Text(model.isConnected ? "\(model.runtimeSettings.captureMode.rawValue)已开启" : "流量接管已关闭")
@@ -1961,7 +2071,7 @@ struct KongApp: App {
         .windowStyle(.hiddenTitleBar)
         .windowToolbarStyle(.unifiedCompact(showsTitle: false))
         .commands {
-            CommandMenu("Kong") {
+            CommandMenu("KongBabel") {
                 Button(model.isConnected ? "关闭系统代理" : "开启系统代理") { model.toggleConnection() }
                     .keyboardShortcut("p", modifiers: [.command, .shift])
                 Button("打开命令面板") { model.showCommandPalette = true }
@@ -2046,7 +2156,7 @@ struct Sidebar: View {
                     .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                 .frame(width: 36, height: 36)
                 VStack(alignment: .leading, spacing: 1) {
-                    Text("Kong").font(.system(size: 17, weight: .bold))
+                    Text("KongBabel").font(.system(size: 17, weight: .bold))
                     Text("网络控制台").font(.system(size: 10, weight: .medium)).foregroundStyle(Theme.secondary)
                 }
             }
@@ -2247,7 +2357,7 @@ struct ConnectionHero: View {
             }.buttonStyle(.plain)
             VStack(spacing: 4) {
                 Text(model.isConnected ? "连接已开启" : "点击以连接").font(.system(size: 15, weight: .bold))
-                Text(model.isConnected ? "流量正在由 Kong 安全转发" : "当前使用系统网络设置").font(.system(size: 11)).foregroundStyle(Theme.secondary)
+                Text(model.isConnected ? "流量正在由 KongBabel 安全转发" : "当前使用系统网络设置").font(.system(size: 11)).foregroundStyle(Theme.secondary)
             }
             Spacer()
         }.card()
@@ -2830,9 +2940,10 @@ struct SettingsView: View {
             ScrollView {
                 VStack(spacing: 16) {
                     SettingsGroup(title: "通用") {
-                        SettingToggle(icon: "power", title: "登录时启动", subtitle: "使用 macOS 原生登录项目运行 Kong", isOn: Binding(get: { model.launchAtLogin }, set: model.setLaunchAtLogin))
+                        SettingToggle(icon: "power", title: "登录时启动", subtitle: "使用 macOS 原生登录项目运行 KongBabel", isOn: Binding(get: { model.launchAtLogin }, set: model.setLaunchAtLogin))
                         SettingToggle(icon: "arrow.clockwise", title: "自动更新订阅", subtitle: "按照每个订阅单独设置的更新间隔检查", isOn: $model.runtimeSettings.automaticSubscriptionUpdates)
                         SettingToggle(icon: "wifi.exclamationmark", title: "网络状态提醒", subtitle: "断网、无法访问互联网、节点失效或内核停止时，在菜单栏图标旁弹出提示", isOn: Binding(get: { model.networkAlertsEnabled }, set: model.setNetworkAlertsEnabled))
+                        SettingToggle(icon: "arrow.triangle.2.circlepath", title: "节点失效时自动切换", subtitle: "经代理连续访问失败时，自动测速并切换到延迟最低的可用节点", isOn: Binding(get: { model.autoSwitchNodeEnabled }, set: model.setAutoSwitchNodeEnabled))
                     }
                     SettingsGroup(title: "流量接管") {
                         SettingsRow(icon: "checkmark.shield", title: "系统实际状态", subtitle: model.detectedCaptureMode?.rawValue ?? (model.isConnected && model.runtimeSettings.captureMode == .tun ? "TUN（由内核接管）" : "未启用")) {
@@ -2845,7 +2956,7 @@ struct SettingsView: View {
                         }
                         SettingToggle(icon: "wifi.router", title: "允许局域网连接", subtitle: "启用 allow-lan 并监听所有本机地址", isOn: $model.runtimeSettings.allowLAN)
                         SettingToggle(icon: "arrow.triangle.merge", title: "混合端口", subtitle: "HTTP 与 SOCKS 共用同一个 mixed-port", isOn: $model.runtimeSettings.useMixedPort)
-                        SettingsRow(icon: "number", title: "监听端口", subtitle: "端口占用时 Kong 会选择相邻可用端口") {
+                        SettingsRow(icon: "number", title: "监听端口", subtitle: "端口占用时 KongBabel 会选择相邻可用端口") {
                             if model.runtimeSettings.useMixedPort {
                                 IntegerSettingField(label: "MIXED", value: $model.runtimeSettings.mixedPort)
                             } else {
@@ -2861,7 +2972,7 @@ struct SettingsView: View {
                         SettingToggle(icon: "point.topleft.down.curvedto.point.bottomright.up", title: "自动路由", subtitle: "对应 auto-route，全局接管系统路由", isOn: $model.runtimeSettings.tunAutoRoute)
                         SettingToggle(icon: "network", title: "自动识别出口", subtitle: "对应 auto-detect-interface", isOn: $model.runtimeSettings.tunAutoDetectInterface)
                         SettingToggle(icon: "globe.badge.chevron.backward", title: "DNS 劫持", subtitle: "接管 UDP/TCP 53 端口查询", isOn: $model.runtimeSettings.tunDNSHijack)
-                        Text("首次开启 TUN 若 macOS 拒绝修改路由，Kong 会显示内核错误；正式分发版应配套 Developer ID 签名的特权辅助程序。")
+                        Text("首次开启 TUN 若 macOS 拒绝修改路由，KongBabel 会显示内核错误；正式分发版应配套 Developer ID 签名的特权辅助程序。")
                             .font(.system(size: 9)).foregroundStyle(Theme.warning).padding(.vertical, 10)
                     }
                     SettingsGroup(title: "DNS 与防泄漏") {
@@ -2929,7 +3040,7 @@ struct SettingsView: View {
                                 .font(.system(size: 9)).foregroundStyle(Theme.secondary).fixedSize(horizontal: false, vertical: true)
                         }.padding(.vertical, 12)
                     }
-                    Text("Kong 1.3.15 (Build 155) · Made for macOS").font(.system(size: 10)).foregroundStyle(Theme.secondary).padding(.top, 4)
+                    Text(AppInfo.versionLine).font(.system(size: 10)).foregroundStyle(Theme.secondary).padding(.top, 4)
                 }.padding(.horizontal, 30).padding(.bottom, 30)
             }
         }
@@ -2939,7 +3050,7 @@ struct SettingsView: View {
 struct DeveloperView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
-            PageHeader(title: "开发者", subtitle: "Kong") { EmptyView() }
+            PageHeader(title: "开发者", subtitle: "KongBabel") { EmptyView() }
             HStack(spacing: 18) {
                 Image(nsImage: NSApplication.shared.applicationIconImage)
                     .resizable()
@@ -3166,7 +3277,7 @@ struct MenuBarContent: View {
                 Image(nsImage: NSApplication.shared.applicationIconImage).resizable().scaledToFit()
                     .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous)).frame(width: 32, height: 32)
                 VStack(alignment: .leading, spacing: 1) {
-                    Text("Kong").font(.system(size: 14, weight: .bold))
+                    Text("KongBabel").font(.system(size: 14, weight: .bold))
                     Text(model.isConnected ? "\(model.runtimeSettings.captureMode.rawValue)已开启" : "流量接管已关闭").font(.system(size: 10)).foregroundStyle(Theme.secondary)
                 }
                 Spacer()

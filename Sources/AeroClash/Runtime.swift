@@ -108,7 +108,7 @@ final class MihomoProcess: @unchecked Sendable {
         check.waitUntilExit()
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         let command = String(data: data, encoding: .utf8) ?? ""
-        let belongsToApp = command.contains("/Kong.app/Contents/Resources/mihomo") || command.contains("/Aero.app/Contents/Resources/mihomo")
+        let belongsToApp = command.contains("/KongBabel.app/Contents/Resources/mihomo") || command.contains("/Kong.app/Contents/Resources/mihomo") || command.contains("/Aero.app/Contents/Resources/mihomo")
         guard belongsToApp, command.contains("Application Support/Aero") else { return }
         kill(pid, SIGTERM)
         usleep(180_000)
@@ -202,7 +202,7 @@ struct WebDAVClient: Sendable {
             let credential = Data("\(settings.username):\(password)".utf8).base64EncodedString()
             request.setValue("Basic \(credential)", forHTTPHeaderField: "Authorization")
         }
-        request.setValue("Kong/1.3 WebDAV", forHTTPHeaderField: "User-Agent")
+        request.setValue("KongBabel/\(AppInfo.version) WebDAV", forHTTPHeaderField: "User-Agent")
         return request
     }
 

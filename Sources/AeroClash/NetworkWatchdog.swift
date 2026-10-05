@@ -112,6 +112,8 @@ final class NetworkWatchdog {
     private var proxyFailures = 0
     private var lastProbe = Date.distantPast
     private var probeInFlight = false
+    /// 自动切换节点后允许对同一故障再次上报（新节点仍不可用时需要再次提醒）。
+    private var reReportAllowed = false
 
     /// 网络正常时的探测间隔；出现失败后缩短间隔以尽快确认。
     private let normalInterval: TimeInterval = 30
@@ -171,6 +173,12 @@ final class NetworkWatchdog {
         proxyFailures = 0
     }
 
+    /// 已采取补救措施（如自动切换节点）：立即重新检测，若仍失败则再次上报同一故障。
+    func retryAfterRemedy() {
+        reReportAllowed = true
+        recheckSoon()
+    }
+
     private func handleProbe(proxyOK: Bool, directOK: Bool) {
         probeInFlight = false
         guard isEnabled, pathSatisfied else { return }
@@ -200,7 +208,8 @@ final class NetworkWatchdog {
     }
 
     private func report(_ issue: NetworkIssue) {
-        guard isEnabled, currentIssue != issue else { return }
+        guard isEnabled, currentIssue != issue || reReportAllowed else { return }
+        reReportAllowed = false
         currentIssue = issue
         onIssue?(issue)
     }
@@ -208,6 +217,7 @@ final class NetworkWatchdog {
     private func resolve() {
         guard let issue = currentIssue else { return }
         currentIssue = nil
+        reReportAllowed = false
         proxyFailures = 0
         onRecover?(issue)
     }
@@ -240,9 +250,11 @@ struct NetworkNotice: Identifiable, Equatable {
     let isRecovery: Bool
     let title: String
     let detail: String
+    /// true 表示提示性消息（如“已自动切换节点”），不需要用户操作。
+    var isInfo = false
 
     var actions: [NetworkNoticeAction] {
-        guard !isRecovery else { return [] }
+        guard !isRecovery, !isInfo else { return [] }
         switch issue {
         case .offline, .internetUnreachable: return [.openNetworkSettings]
         case .proxyUnreachable: return [.testAndSwitch, .diagnose]
@@ -252,6 +264,7 @@ struct NetworkNotice: Identifiable, Equatable {
 
     var symbol: String {
         if isRecovery { return "checkmark.circle.fill" }
+        if isInfo { return "arrow.triangle.2.circlepath.circle.fill" }
         switch issue {
         case .offline: return "wifi.slash"
         case .internetUnreachable: return "wifi.exclamationmark"
