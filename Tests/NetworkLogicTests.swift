@@ -79,6 +79,33 @@ struct NetworkLogicTests {
         let encoded = try JSONEncoder().encode(["2": binding])
         try expect(try JSONDecoder().decode([String: HotKeyBinding].self, from: encoded)["2"] == binding, "快捷键保存后读取不一致")
 
+        // WebDAV 备份：新备份带个人偏好，旧备份（没有 preferences）也能读取
+        var bundle = AeroBackupBundle(schemaVersion: 1, generatedAt: Date(timeIntervalSince1970: 1_800_000_000),
+                                      profiles: [], runtimeSettings: .standard, files: [:])
+        bundle.preferences = BackupPreferences(
+            favoriteNodes: ["日本 01"], excludedNodes: ["美国 09"], hotKeyBindings: ["1": KongHotKey.toggleProxy.defaultBinding],
+            networkAlertsEnabled: true, autoSwitchNodeEnabled: false, highLatencyThreshold: 800,
+            subscriptionRemindersEnabled: true, globalHotKeysEnabled: true, autoUpdateCheckEnabled: false,
+            showMenuBarRates: true, networkEvents: events, nodeStats: ["日本 01": recent]
+        )
+        let bundleData = try JSONEncoder().encode(bundle)
+        let decodedBundle = try JSONDecoder().decode(AeroBackupBundle.self, from: bundleData)
+        try expect(decodedBundle.preferences == bundle.preferences, "备份中的个人偏好保存后读取不一致")
+        var legacy = try JSONSerialization.jsonObject(with: bundleData) as? [String: Any] ?? [:]
+        legacy.removeValue(forKey: "preferences")
+        let legacyBundle = try JSONDecoder().decode(AeroBackupBundle.self, from: JSONSerialization.data(withJSONObject: legacy))
+        try expect(legacyBundle.preferences == nil, "旧版备份应能正常读取且不含个人偏好")
+
+        // 合并网络事件与节点记录
+        let extra = NetworkEvent(date: Date(timeIntervalSince1970: 1_800_000_200), kind: .offline, title: "网络未连接", detail: "", duration: nil)
+        let mergedEvents = BackupPreferences.mergeEvents(events, [events[0], extra])
+        try expect(mergedEvents.count == 3 && mergedEvents.first == extra, "网络事件合并错误")
+        var remoteStats = NodeStats()
+        remoteStats.samples = [.init(date: now, delay: 500)]
+        let mergedStats = BackupPreferences.mergeNodeStats(["A": stats], ["A": remoteStats, "B": remoteStats], now: now)
+        try expect(mergedStats["A"]?.samples.count == 3, "节点记录合并错误")
+        try expect(mergedStats["B"]?.averageDelay == 500, "新增节点记录合并错误")
+
         print("NetworkLogicTests passed")
     }
 }

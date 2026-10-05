@@ -164,6 +164,8 @@ struct AeroBackupBundle: Codable {
     let profiles: [Profile]
     let runtimeSettings: RuntimeSettings
     let files: [String: Data]
+    /// 1.9.4 起加入；旧备份没有这一项
+    var preferences: BackupPreferences? = nil
 }
 
 struct WebDAVClient: Sendable {
